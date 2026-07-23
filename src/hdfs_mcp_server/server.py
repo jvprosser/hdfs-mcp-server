@@ -8,20 +8,39 @@
 import os
 import sys
 import logging
-from typing import List, Dict, Any
+import subprocess
+from typing import List, Dict, Any, Tuple
 from urllib.parse import urlparse
-from mcp.server.fastmcp import FastMCP
-import pyarrow.fs as pafs
 
-# Ensure python logging streams to stderr to protect the MCP stdout JSON channel
+# 1. Force Python logging to stderr to keep stdout clean for MCP JSON-RPC traffic
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("hdfs-mcp-server")
 
-# Prevent log4j / Hadoop stdout noise
+# 2. Silence log4j / Hadoop stdout output
 os.environ["HADOOP_ROOT_LOGGER"] = "WARN,console"
 os.environ["LIBHDFS_OPTS"] = "-Dlog4j.configuration=file:///dev/null"
 
-# Initialize FastMCP Server
+# 3. Dynamically discover full Hadoop Classpath (includes HDFS, S3A, ADLS, Ozone, RAZ)
+def configure_hadoop_classpath():
+    try:
+        cmd = ["hadoop", "classpath", "--glob"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        discovered_cp = result.stdout.strip()
+        
+        existing_cp = os.environ.get("CLASSPATH", "")
+        # Prepend /etc/hadoop/conf so site XMLs take priority
+        os.environ["CLASSPATH"] = f"/etc/hadoop/conf:{discovered_cp}:{existing_cp}"
+        logger.info("Successfully configured Hadoop CLASSPATH via 'hadoop classpath --glob'")
+    except Exception as e:
+        logger.warning(f"Could not execute 'hadoop classpath --glob': {e}. Relying on environment CLASSPATH.")
+
+configure_hadoop_classpath()
+
+# Import PyArrow AFTER CLASSPATH and environment variables are set
+import pyarrow.fs as pafs
+from mcp.server.fastmcp import FastMCP
+
+# Initialize MCP Server
 mcp = FastMCP(
     "Cloudera Enterprise Storage MCP",
     dependencies=["pyarrow", "mcp"]
@@ -35,25 +54,11 @@ def get_user_context() -> str:
     return user
 
 
-def get_hadoop_filesystem() -> pafs.FileSystem:
+def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
     """
-    Instantiates PyArrow HadoopFileSystem with host='default'.
-    Setting host='default' forces libhdfs to use core-site.xml and 
-    delegate scheme routing (hdfs://, s3a://, abfs://, ofs://) to Java Hadoop.
+    Parse URI scheme and return PyArrow HadoopFileSystem configured
+    with CDP RAZ parameters alongside relative path.
     """
-    try:
-        return pafs.HadoopFileSystem(
-            host="default",
-            port=0,
-            user=get_user_context()
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize HadoopFileSystem: {str(e)}")
-        raise RuntimeError(f"Storage connection failed via RAZ: {str(e)}")
-
-
-def validate_scheme(path_uri: str) -> str:
-    """Validates that the URI scheme is supported."""
     parsed = urlparse(path_uri)
     scheme = parsed.scheme.lower()
     
@@ -62,7 +67,25 @@ def validate_scheme(path_uri: str) -> str:
             f"Unsupported filesystem scheme: '{scheme}'. "
             "Supported schemes: hdfs://, s3a://, abfs://, ofs://"
         )
-    return path_uri
+
+    try:
+        if parsed.netloc:
+            host = f"{scheme}://{parsed.netloc}"
+        else:
+            host = "default"
+
+        fs = pafs.HadoopFileSystem(
+            host=host,
+            port=0,
+            user=get_user_context()
+        )
+        
+        relative_path = parsed.path if parsed.path else "/"
+        return fs, relative_path
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize filesystem for {path_uri}: {str(e)}")
+        raise RuntimeError(f"Storage connection failed via RAZ: {str(e)}")
 
 
 @mcp.tool()
@@ -74,11 +97,10 @@ def list_directory(path: str, recursive: bool = False) -> List[Dict[str, Any]]:
     :param recursive: If True, lists subdirectories recursively.
     :return: List of object metadata dictionaries (path, type, size, mtime).
     """
+    fs, clean_path = resolve_filesystem(path)
+    
+    selector = pafs.FileSelector(clean_path, recursive=recursive)
     try:
-        clean_path = validate_scheme(path)
-        fs = get_hadoop_filesystem()
-        
-        selector = pafs.FileSelector(clean_path, recursive=recursive)
         file_infos = fs.get_file_info(selector)
         results = []
         
@@ -112,10 +134,9 @@ def open_file(
     :param encoding: String encoding (default 'utf-8'). Use 'bytes' for raw hex output.
     :return: File content metadata and body payload.
     """
+    fs, clean_path = resolve_filesystem(path)
+    
     try:
-        clean_path = validate_scheme(path)
-        fs = get_hadoop_filesystem()
-        
         info = fs.get_file_info(clean_path)
         if info.type == pafs.FileType.Directory:
             return {"error": f"Path '{path}' is a directory, not a file."}
@@ -144,7 +165,7 @@ def open_file(
             }
             
     except Exception as e:
-        return {"error": f"Failed to read file '{path}': {str(e)}"}
+        return [{"error": f"Failed to read file '{path}': {str(e)}"}]
 
 
 def main():
