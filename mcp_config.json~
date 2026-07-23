@@ -1,0 +1,16 @@
+{
+    "mcpServers": {
+	"cloudera-raz-storage": {
+	    "command": "uv",
+	    "args": [
+		"run",
+		"/absolute/path/to/hdfs-mcp-server/src/hdfs_mcp_server/server.py"
+	    ],
+	    "env": {
+		"HADOOP_CONF_DIR": "/etc/hadoop/conf",
+		"JAVA_HOME": "/usr/lib/jvm/java-11-openjdk",
+		"CDP_WORKLOAD_USER": "$CML_USER"
+	    }
+	}
+    }
+}

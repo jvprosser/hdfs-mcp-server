@@ -1,0 +1,17 @@
+[project]
+name = "hdfs-mcp-server"
+version = "0.1.0"
+description = "MCP Server for Cloudera Agent Studio supporting HDFS, S3a, ADLS, and Ozone via RAZ"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=0.1.0",
+        "pyarrow>=14.0.0",
+	]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+hdfs-mcp-server = "hdfs_mcp_server.server:main"
