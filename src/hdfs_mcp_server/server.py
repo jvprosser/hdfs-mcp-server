@@ -21,18 +21,92 @@ os.environ["HADOOP_ROOT_LOGGER"] = "WARN,console"
 os.environ["LIBHDFS_OPTS"] = "-Dlog4j.configuration=file:///dev/null"
 
 # 3. Dynamically discover full Hadoop Classpath (includes HDFS, S3A, ADLS, Ozone, RAZ)
+def _find_aws_sdk_classpath_dirs() -> List[str]:
+    """Locate the AWS SDK v2 shaded bundle jar and return the dirs holding it.
+
+    CDP's S3A connector uses the AWS SDK v2 (``software.amazon.awssdk``), shipped
+    as a shaded ``bundle-<version>.jar``. This jar lives in the Hadoop *tools*
+    area, which ``hadoop classpath`` does NOT include by default, producing
+    ``ClassNotFoundException: software.amazon.awssdk.transfer.s3.progress.TransferListener``
+    when instantiating an s3a:// filesystem. We locate it so it can be added to
+    the classpath the libhdfs JVM sees.
+
+    An explicit ``HDFS_MCP_AWS_SDK_DIR`` (directory containing the jar) short-
+    circuits the search.
+    """
+    override = os.getenv("HDFS_MCP_AWS_SDK_DIR", "").strip()
+    if override:
+        return [override]
+
+    # Roots most likely to contain the bundle, in preference order. We avoid
+    # scanning huge trees like /usr/lib or /opt/cloudera/parcels wholesale.
+    libhdfs_dir = os.environ.get("ARROW_LIBHDFS_DIR", "")
+    roots = []
+    if os.environ.get("HADOOP_HOME"):
+        roots.append(os.environ["HADOOP_HOME"])
+    if libhdfs_dir:
+        roots.append(libhdfs_dir)                      # e.g. /runtime-addons/.../usr/lib
+        roots.append(os.path.dirname(libhdfs_dir))     # e.g. /runtime-addons/.../usr
+    roots.append("/runtime-addons")
+
+    found_dirs: List[str] = []
+    seen = set()
+    for root in roots:
+        if not root or not os.path.isdir(root) or root in seen:
+            continue
+        seen.add(root)
+        try:
+            result = subprocess.run(
+                ["find", "-L", root, "-maxdepth", "8", "-type", "f",
+                 "(", "-name", "bundle-*.jar", "-o", "-name", "aws-java-sdk-bundle-*.jar", ")"],
+                capture_output=True, text=True, timeout=20,
+            )
+        except Exception as e:
+            logger.warning(f"AWS SDK jar search failed under '{root}': {e}")
+            continue
+        for jar in filter(None, (line.strip() for line in result.stdout.splitlines())):
+            d = os.path.dirname(jar)
+            if d not in found_dirs:
+                found_dirs.append(d)
+                logger.info(f"Discovered AWS SDK bundle jar: {jar}")
+        if found_dirs:
+            break  # first root that yields a bundle is sufficient
+
+    if not found_dirs:
+        logger.warning(
+            "Could not locate an AWS SDK bundle jar (bundle-*.jar). s3a:// access may "
+            "fail with ClassNotFoundException for software.amazon.awssdk classes. Set "
+            "HDFS_MCP_AWS_SDK_DIR to the directory containing the jar."
+        )
+    return found_dirs
+
+
 def configure_hadoop_classpath():
+    parts: List[str] = ["/etc/hadoop/conf"]  # site XMLs take priority
+
     try:
-        cmd = ["hadoop", "classpath", "--glob"]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        discovered_cp = result.stdout.strip()
-        
-        existing_cp = os.environ.get("CLASSPATH", "")
-        # Prepend /etc/hadoop/conf so site XMLs take priority
-        os.environ["CLASSPATH"] = f"/etc/hadoop/conf:{discovered_cp}:{existing_cp}"
-        logger.info("Successfully configured Hadoop CLASSPATH via 'hadoop classpath --glob'")
+        result = subprocess.run(
+            ["hadoop", "classpath", "--glob"], capture_output=True, text=True, check=True
+        )
+        parts.append(result.stdout.strip())
+        logger.info("Configured Hadoop CLASSPATH via 'hadoop classpath --glob'")
     except Exception as e:
         logger.warning(f"Could not execute 'hadoop classpath --glob': {e}. Relying on environment CLASSPATH.")
+
+    # Ensure the AWS SDK v2 bundle is present (required by the S3A connector).
+    for d in _find_aws_sdk_classpath_dirs():
+        parts.append(os.path.join(d, "*"))
+
+    existing_cp = os.environ.get("CLASSPATH", "")
+    if existing_cp:
+        parts.append(existing_cp)
+
+    # Allow arbitrary extra classpath entries without editing this file.
+    extra_cp = os.getenv("HDFS_MCP_EXTRA_CLASSPATH", "").strip()
+    if extra_cp:
+        parts.append(extra_cp)
+
+    os.environ["CLASSPATH"] = ":".join(p for p in parts if p)
 
 configure_hadoop_classpath()
 

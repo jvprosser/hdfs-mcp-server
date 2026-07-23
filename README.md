@@ -20,10 +20,12 @@ intentional:
 
 For this to work:
 
-1. The container must have the Hadoop **classpath** (including `hadoop-aws` and
-   `ranger-raz` jars) and `/etc/hadoop/conf` on the `CLASSPATH` so `core-site.xml`
-   (which carries the RAZ delegation-token binding) is loaded. The server auto-runs
-   `hadoop classpath --glob` at startup and prepends `/etc/hadoop/conf`.
+1. The container must have the Hadoop **classpath** (including `hadoop-aws`, the
+   **AWS SDK v2 bundle** (`bundle-*.jar`), and `ranger-raz` jars) and
+   `/etc/hadoop/conf` on the `CLASSPATH` so `core-site.xml` (which carries the RAZ
+   delegation-token binding) is loaded. The server auto-runs `hadoop classpath
+   --glob` at startup, prepends `/etc/hadoop/conf`, and **auto-discovers the AWS
+   SDK v2 bundle jar** (see below).
 2. The workload user identity is taken from `CDP_WORKLOAD_USER` (mapped from
    `$CML_USER`). RAZ authorizes the `s3a://bucket/path` request against the Ranger
    policies for **that** user.
@@ -35,16 +37,45 @@ For this to work:
 ### Default filesystem (optional)
 
 By default every tool call must pass a **fully-qualified URI** (e.g.
-`s3a://go01-demo/data/logs`). For single-bucket deployments you can set
-`HDFS_MCP_DEFAULT_FS` (e.g. `s3a://go01-demo`) so that **scheme-less / relative
+`s3a://YOURBUCKET/data/logs`). For single-bucket deployments you can set
+`HDFS_MCP_DEFAULT_FS` (e.g. `s3a://YOURBUCKET`) so that **scheme-less / relative
 paths** like `/data/logs` resolve against that bucket. Fully-qualified URIs always
 take precedence over this default.
 
 ```json
 "env": {
-  "HDFS_MCP_DEFAULT_FS": "s3a://go01-demo"
+  "HDFS_MCP_DEFAULT_FS": "s3a://YOURBUCKET"
 }
 ```
+
+### AWS SDK v2 bundle on the classpath
+
+CDP's S3A connector uses the **AWS SDK v2** (`software.amazon.awssdk`), shipped as a
+shaded `bundle-<version>.jar`. That jar lives in the Hadoop *tools* area, which
+`hadoop classpath` does **not** include by default, so instantiating an `s3a://`
+filesystem otherwise fails with:
+
+```
+ClassNotFoundException: software.amazon.awssdk.transfer.s3.progress.TransferListener
+```
+
+On startup the server searches `HADOOP_HOME`, `ARROW_LIBHDFS_DIR` (and its parent),
+and `/runtime-addons` for `bundle-*.jar` / `aws-java-sdk-bundle-*.jar` and adds the
+containing directory to the classpath. If your layout differs:
+
+* Set `HDFS_MCP_AWS_SDK_DIR` to the directory that contains the bundle jar, **or**
+* Set `HDFS_MCP_EXTRA_CLASSPATH` to any extra classpath entries to append.
+
+To locate it manually in your environment:
+
+```bash
+find / -name 'bundle-*.jar' 2>/dev/null | grep -Ei 'aws|awssdk'
+```
+
+> Do not put both the AWS SDK **v1** (`aws-java-sdk-bundle-*.jar`) and **v2**
+> (`bundle-*.jar`) on the classpath at the same time unless required — mixing SDK
+> versions can cause linkage errors. Prefer the v2 `bundle-*.jar` that matches the
+> Hadoop version.
 
 ### Why the bucket is passed as `fs.defaultFS`
 
@@ -54,7 +85,7 @@ value, so connecting with `host="s3a://bucket"` produces a namenode of
 string that bypasses this is the literal `"default"`, which tells libhdfs to use
 `fs.defaultFS`. The server therefore connects with `host="default"` and overrides
 `fs.defaultFS` (via `extra_conf`) to the target authority — e.g.
-`s3a://go01-demo` — so libhdfs instantiates the correct Java `S3AFileSystem`
+`s3a://YOURBUCKET` — so libhdfs instantiates the correct Java `S3AFileSystem`
 (where RAZ is enforced). Requested paths are then resolved relative to that bucket.
 
 ---
