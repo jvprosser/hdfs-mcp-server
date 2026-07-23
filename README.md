@@ -30,7 +30,7 @@ Add the following to your MCP settings inside CML / Agent Studio:
 	    "env": {
 		  "HADOOP_CONF_DIR": "/etc/hadoop/conf",
 		  "ARROW_LIBHDFS_DIR": "/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib",
-		  "JAVA_HOME": "/usr/lib/jvm/java-11-openjdk",
+		  "JAVA_HOME": "/usr/lib/jvm/java-8-openjdk-amd64",
 		  "CLASSPATH": "/etc/hadoop/conf:/usr/lib/hadoop/*:/usr/lib/hadoop/lib/*:/usr/lib/hadoop-hdfs/*:/usr/lib/hadoop-hdfs/lib/*",
 		  "CDP_WORKLOAD_USER": "$CML_USER"
 	    }
