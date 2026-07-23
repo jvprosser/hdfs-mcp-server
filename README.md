@@ -108,6 +108,8 @@ Add the following to your MCP settings inside CML / Agent Studio:
       "command": "uvx",
       "args": [
         "--quiet",
+        "--refresh",
+        "--reinstall",
         "--from",
         "git+https://github.com/jvprosser/hdfs-mcp-server.git",
         "hdfs-mcp-server"

@@ -4,6 +4,8 @@
       "command": "uvx",
       "args": [
         "--quiet",
+        "--refresh",
+        "--reinstall",
         "--from",
         "git+https://github.com/jvprosser/hdfs-mcp-server.git",
         "hdfs-mcp-server"
