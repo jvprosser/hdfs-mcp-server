@@ -32,6 +32,17 @@ For this to work:
    `HDFS_MCP_EXTRA_CONF` environment variable as comma-separated `key=value` pairs,
    e.g. `HDFS_MCP_EXTRA_CONF="fs.s3a.connection.maximum=100,fs.s3a.threads.max=64"`.
 
+### Why the bucket is passed as `fs.defaultFS`
+
+PyArrow's `HadoopFileSystem` forces the `hdfs://` scheme onto any explicit `host`
+value, so connecting with `host="s3a://bucket"` produces a namenode of
+`hdfs://s3a://bucket` and fails with `UnknownHostException: s3a`. The only host
+string that bypasses this is the literal `"default"`, which tells libhdfs to use
+`fs.defaultFS`. The server therefore connects with `host="default"` and overrides
+`fs.defaultFS` (via `extra_conf`) to the target authority — e.g.
+`s3a://go01-demo` — so libhdfs instantiates the correct Java `S3AFileSystem`
+(where RAZ is enforced). Requested paths are then resolved relative to that bucket.
+
 ---
 
 ## Included Tools

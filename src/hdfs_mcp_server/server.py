@@ -96,13 +96,26 @@ def build_raz_conf() -> Dict[str, str]:
 
 def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
     """
-    Parse URI scheme and return a PyArrow HadoopFileSystem configured for
-    CDP RAZ, alongside the path relative to that filesystem.
+    Parse a fully-qualified storage URI and return a PyArrow HadoopFileSystem
+    configured for CDP RAZ, alongside the path relative to that filesystem.
 
     Access is routed through libhdfs (the JNI bridge to the Java Hadoop
     client) rather than PyArrow's native S3FileSystem. This is deliberate:
     RAZ authorization is enforced in the Java S3A connector, so the native
     S3 client would bypass RAZ entirely.
+
+    Note on connecting to non-HDFS schemes (s3a/abfs/ofs)
+    -----------------------------------------------------
+    PyArrow's HadoopFileSystem hardcodes the ``hdfs://`` scheme onto any
+    explicit ``host`` value. Passing ``host="s3a://bucket"`` therefore
+    produces a namenode of ``hdfs://s3a://bucket`` and fails with
+    ``UnknownHostException: s3a``. The only host that escapes this behavior
+    is the literal ``"default"``, which makes libhdfs use ``fs.defaultFS``.
+    So we always connect with ``host="default"`` and, for a URI that carries
+    an authority (bucket / container / volume / nameservice), override
+    ``fs.defaultFS`` via ``extra_conf`` so libhdfs instantiates the correct
+    Java FileSystem (S3A, ABFS, Ozone, or HDFS). Paths are then resolved
+    relative to that default filesystem.
     """
     parsed = urlparse(path_uri)
     scheme = parsed.scheme.lower()
@@ -113,28 +126,31 @@ def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
             "Supported schemes: hdfs://, s3a://, abfs://, abfss://, ofs://"
         )
 
-    # For object stores (s3a/abfs/ofs) the authority (bucket / container /
-    # volume) is part of the filesystem URI. For HDFS with no explicit
-    # authority we fall back to fs.defaultFS via the "default" sentinel.
-    if parsed.netloc:
-        host = f"{scheme}://{parsed.netloc}"
-    else:
-        host = "default"
+    # The authority (e.g. the S3 bucket in s3a://go01-demo/...) becomes the
+    # default filesystem. If absent (e.g. hdfs:///path) we fall back to the
+    # fs.defaultFS already configured in core-site.xml.
+    default_fs = f"{scheme}://{parsed.netloc}" if parsed.netloc else None
 
     user = get_user_context()
-    cache_key = (host, user)
+    cache_key = (default_fs or "default", user)
 
     fs = _FS_CACHE.get(cache_key)
     if fs is None:
+        extra_conf = build_raz_conf()
+        if default_fs:
+            extra_conf["fs.defaultFS"] = default_fs
         try:
             fs = pafs.HadoopFileSystem(
-                host=host,
+                host="default",
                 port=0,
                 user=user,
-                extra_conf=build_raz_conf(),
+                extra_conf=extra_conf,
             )
             _FS_CACHE[cache_key] = fs
-            logger.info(f"Initialized RAZ-authorized filesystem for host '{host}' as user '{user}'")
+            logger.info(
+                f"Initialized RAZ-authorized filesystem "
+                f"(fs.defaultFS='{default_fs or '<core-site>'}') as user '{user}'"
+            )
         except Exception as e:
             logger.error(f"Failed to initialize filesystem for {path_uri}: {str(e)}")
             raise RuntimeError(f"Storage connection failed via RAZ: {str(e)}")
