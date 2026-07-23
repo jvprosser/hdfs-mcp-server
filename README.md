@@ -6,6 +6,34 @@ An Model Context Protocol (MCP) Server for **Cloudera Agent Studio**. Provides s
 
 ---
 
+## How RAZ authorization works (S3A)
+
+Access is routed through **`libhdfs`** (the JNI bridge to the Java Hadoop client) via
+PyArrow's `HadoopFileSystem` — **not** PyArrow's native `S3FileSystem`. This is
+intentional:
+
+* RAZ authorization is enforced inside the **Java S3A connector**. Every `s3a://`
+  request is intercepted and authorized against **Ranger policies** for the active
+  workload user before it reaches S3.
+* PyArrow's native `S3FileSystem` talks directly to AWS via the C++ SDK and would
+  **bypass RAZ entirely**, so it is not used here.
+
+For this to work:
+
+1. The container must have the Hadoop **classpath** (including `hadoop-aws` and
+   `ranger-raz` jars) and `/etc/hadoop/conf` on the `CLASSPATH` so `core-site.xml`
+   (which carries the RAZ delegation-token binding) is loaded. The server auto-runs
+   `hadoop classpath --glob` at startup and prepends `/etc/hadoop/conf`.
+2. The workload user identity is taken from `CDP_WORKLOAD_USER` (mapped from
+   `$CML_USER`). RAZ authorizes the `s3a://bucket/path` request against the Ranger
+   policies for **that** user.
+3. The server sets `fs.s3a.signature.cache.max.size=0`, which Cloudera requires for
+   RAZ-enabled S3 access. Additional Hadoop settings can be supplied via the
+   `HDFS_MCP_EXTRA_CONF` environment variable as comma-separated `key=value` pairs,
+   e.g. `HDFS_MCP_EXTRA_CONF="fs.s3a.connection.maximum=100,fs.s3a.threads.max=64"`.
+
+---
+
 ## Included Tools
 
 * **`list_directory(path: str, recursive: bool = False)`**: Lists entries inside target URI.

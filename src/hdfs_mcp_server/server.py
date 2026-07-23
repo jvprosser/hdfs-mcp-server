@@ -47,45 +47,100 @@ mcp = FastMCP(
 )
 
 
+SUPPORTED_SCHEMES = ("hdfs", "s3a", "abfs", "abfss", "ofs")
+
+# Cache of instantiated HadoopFileSystem objects keyed by (host, user). Each
+# HadoopFileSystem instantiation spins up a JVM FileSystem via libhdfs (JNI),
+# so we reuse connections across tool calls for the same bucket/user.
+_FS_CACHE: Dict[Tuple[str, str], "pafs.HadoopFileSystem"] = {}
+
+
 def get_user_context() -> str:
-    """Extract active CDP user identity from environment."""
+    """Extract active CDP user identity from environment.
+
+    RAZ authorizes every storage request against the workload user, so this
+    identity determines which Ranger policies apply. In Cloudera Agent Studio /
+    CML the workload user is exposed via CDP_WORKLOAD_USER.
+    """
     user = os.getenv("CDP_WORKLOAD_USER") or os.getenv("USER") or "default_user"
     logger.info(f"Executing storage request under user context: {user}")
     return user
 
 
+def build_raz_conf() -> Dict[str, str]:
+    """Return extra Hadoop configuration required for RAZ-authorized access.
+
+    These settings supplement (but do not replace) the RAZ delegation-token
+    binding that Cloudera deploys into core-site.xml. Disabling the S3A
+    signature cache is explicitly required by Cloudera for RAZ-enabled S3
+    access; leaving it enabled can produce spurious authorization failures.
+    Any value may be overridden via the HDFS_MCP_EXTRA_CONF environment
+    variable (comma-separated key=value pairs).
+    """
+    conf: Dict[str, str] = {
+        # Required by Cloudera for RAZ-enabled S3 access.
+        "fs.s3a.signature.cache.max.size": "0",
+    }
+
+    extra = os.getenv("HDFS_MCP_EXTRA_CONF", "").strip()
+    if extra:
+        for pair in extra.split(","):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            key, _, value = pair.partition("=")
+            conf[key.strip()] = value.strip()
+
+    return conf
+
+
 def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
     """
-    Parse URI scheme and return PyArrow HadoopFileSystem configured
-    with CDP RAZ parameters alongside relative path.
+    Parse URI scheme and return a PyArrow HadoopFileSystem configured for
+    CDP RAZ, alongside the path relative to that filesystem.
+
+    Access is routed through libhdfs (the JNI bridge to the Java Hadoop
+    client) rather than PyArrow's native S3FileSystem. This is deliberate:
+    RAZ authorization is enforced in the Java S3A connector, so the native
+    S3 client would bypass RAZ entirely.
     """
     parsed = urlparse(path_uri)
     scheme = parsed.scheme.lower()
-    
-    if scheme not in ["hdfs", "s3a", "abfs", "abfss", "ofs"]:
+
+    if scheme not in SUPPORTED_SCHEMES:
         raise ValueError(
             f"Unsupported filesystem scheme: '{scheme}'. "
-            "Supported schemes: hdfs://, s3a://, abfs://, ofs://"
+            "Supported schemes: hdfs://, s3a://, abfs://, abfss://, ofs://"
         )
 
-    try:
-        if parsed.netloc:
-            host = f"{scheme}://{parsed.netloc}"
-        else:
-            host = "default"
+    # For object stores (s3a/abfs/ofs) the authority (bucket / container /
+    # volume) is part of the filesystem URI. For HDFS with no explicit
+    # authority we fall back to fs.defaultFS via the "default" sentinel.
+    if parsed.netloc:
+        host = f"{scheme}://{parsed.netloc}"
+    else:
+        host = "default"
 
-        fs = pafs.HadoopFileSystem(
-            host=host,
-            port=0,
-            user=get_user_context()
-        )
-        
-        relative_path = parsed.path if parsed.path else "/"
-        return fs, relative_path
-        
-    except Exception as e:
-        logger.error(f"Failed to initialize filesystem for {path_uri}: {str(e)}")
-        raise RuntimeError(f"Storage connection failed via RAZ: {str(e)}")
+    user = get_user_context()
+    cache_key = (host, user)
+
+    fs = _FS_CACHE.get(cache_key)
+    if fs is None:
+        try:
+            fs = pafs.HadoopFileSystem(
+                host=host,
+                port=0,
+                user=user,
+                extra_conf=build_raz_conf(),
+            )
+            _FS_CACHE[cache_key] = fs
+            logger.info(f"Initialized RAZ-authorized filesystem for host '{host}' as user '{user}'")
+        except Exception as e:
+            logger.error(f"Failed to initialize filesystem for {path_uri}: {str(e)}")
+            raise RuntimeError(f"Storage connection failed via RAZ: {str(e)}")
+
+    relative_path = parsed.path if parsed.path else "/"
+    return fs, relative_path
 
 
 @mcp.tool()
@@ -165,7 +220,7 @@ def open_file(
             }
             
     except Exception as e:
-        return [{"error": f"Failed to read file '{path}': {str(e)}"}]
+        return {"error": f"Failed to read file '{path}': {str(e)}"}
 
 
 def main():
