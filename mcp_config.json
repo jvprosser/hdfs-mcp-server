@@ -1,11 +1,10 @@
 {
   "mcpServers": {
     "cloudera-raz-storage": {
-      "command": "uv",
+      "command": "uvx",
       "args": [
-        "run",
         "--quiet",
-        "--with",
+        "--from",
         "git+https://github.com/jvprosser/hdfs-mcp-server.git",
         "hdfs-mcp-server"
       ],
