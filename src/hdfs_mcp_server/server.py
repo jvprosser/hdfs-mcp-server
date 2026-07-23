@@ -8,16 +8,20 @@
 import os
 import sys
 import logging
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP
 import pyarrow.fs as pafs
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Ensure python logging streams to stderr to protect the MCP stdout JSON channel
+logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger("hdfs-mcp-server")
 
-# Initialize MCP Server
+# Prevent log4j / Hadoop stdout noise
+os.environ["HADOOP_ROOT_LOGGER"] = "WARN,console"
+os.environ["LIBHDFS_OPTS"] = "-Dlog4j.configuration=file:///dev/null"
+
+# Initialize FastMCP Server
 mcp = FastMCP(
     "Cloudera Enterprise Storage MCP",
     dependencies=["pyarrow", "mcp"]
@@ -31,11 +35,25 @@ def get_user_context() -> str:
     return user
 
 
-def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
+def get_hadoop_filesystem() -> pafs.FileSystem:
     """
-    Parse URI scheme and return PyArrow HadoopFileSystem configured
-    with CDP RAZ parameters alongside relative path.
+    Instantiates PyArrow HadoopFileSystem with host='default'.
+    Setting host='default' forces libhdfs to use core-site.xml and 
+    delegate scheme routing (hdfs://, s3a://, abfs://, ofs://) to Java Hadoop.
     """
+    try:
+        return pafs.HadoopFileSystem(
+            host="default",
+            port=0,
+            user=get_user_context()
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize HadoopFileSystem: {str(e)}")
+        raise RuntimeError(f"Storage connection failed via RAZ: {str(e)}")
+
+
+def validate_scheme(path_uri: str) -> str:
+    """Validates that the URI scheme is supported."""
     parsed = urlparse(path_uri)
     scheme = parsed.scheme.lower()
     
@@ -44,27 +62,7 @@ def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
             f"Unsupported filesystem scheme: '{scheme}'. "
             "Supported schemes: hdfs://, s3a://, abfs://, ofs://"
         )
-
-    try:
-        # Pass the full authority (e.g., 's3a://go01-demo', 'abfs://container@account', 'hdfs://nameservice')
-        # so libhdfs delegates to the proper Hadoop FileSystem class (S3AFileSystem, AzureBlobFileSystem, etc.)
-        if parsed.netloc:
-            host = f"{scheme}://{parsed.netloc}"
-        else:
-            host = "default"
-
-        fs = pafs.HadoopFileSystem(
-            host=host,
-            port=0,
-            user=get_user_context()
-        )
-        
-        relative_path = parsed.path if parsed.path else "/"
-        return fs, relative_path
-        
-    except Exception as e:
-        logger.error(f"Failed to initialize filesystem for {path_uri}: {str(e)}")
-        raise RuntimeError(f"Storage connection failed via RAZ: {str(e)}")
+    return path_uri
 
 
 @mcp.tool()
@@ -76,10 +74,11 @@ def list_directory(path: str, recursive: bool = False) -> List[Dict[str, Any]]:
     :param recursive: If True, lists subdirectories recursively.
     :return: List of object metadata dictionaries (path, type, size, mtime).
     """
-    fs, clean_path = resolve_filesystem(path)
-    
-    selector = pafs.FileSelector(clean_path, recursive=recursive)
     try:
+        clean_path = validate_scheme(path)
+        fs = get_hadoop_filesystem()
+        
+        selector = pafs.FileSelector(clean_path, recursive=recursive)
         file_infos = fs.get_file_info(selector)
         results = []
         
@@ -113,9 +112,10 @@ def open_file(
     :param encoding: String encoding (default 'utf-8'). Use 'bytes' for raw hex output.
     :return: File content metadata and body payload.
     """
-    fs, clean_path = resolve_filesystem(path)
-    
     try:
+        clean_path = validate_scheme(path)
+        fs = get_hadoop_filesystem()
+        
         info = fs.get_file_info(clean_path)
         if info.type == pafs.FileType.Directory:
             return {"error": f"Path '{path}' is a directory, not a file."}
@@ -144,7 +144,7 @@ def open_file(
             }
             
     except Exception as e:
-        return [{"error": f"Failed to read file '{path}': {str(e)}"}]
+        return {"error": f"Failed to read file '{path}': {str(e)}"}
 
 
 def main():
