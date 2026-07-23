@@ -19,21 +19,23 @@ Add the following to your MCP settings inside CML / Agent Studio:
 
 ```json
 {
-    "mcpServers": {
-	  "hdfs-mcp-server": {
-	    "command": "uvx",        
-	    "args": [
-		  "--from",
-		  "git+https://github.com/jvprosser/hdfs-mcp-server.git",
-		  "hdfs-mcp-server"
-	    ],
-	    "env": {
-		  "HADOOP_CONF_DIR": "/etc/hadoop/conf",
-		  "ARROW_LIBHDFS_DIR": "/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib",
-		  "JAVA_HOME": "/usr/lib/jvm/java-8-openjdk-amd64",
-		  "CLASSPATH": "/etc/hadoop/conf:/usr/lib/hadoop/*:/usr/lib/hadoop/lib/*:/usr/lib/hadoop-hdfs/*:/usr/lib/hadoop-hdfs/lib/*",
-		  "CDP_WORKLOAD_USER": "$CML_USER"
-	    }
-	  }
+  "mcpServers": {
+    "cloudera-raz-storage": {
+      "command": "uvx",
+      "args": [
+        "--quiet",
+        "--from",
+        "git+https://github.com/jvprosser/hdfs-mcp-server.git",
+        "hdfs-mcp-server"
+      ],
+      "env": {
+        "HADOOP_CONF_DIR": "/etc/hadoop/conf",
+        "JAVA_HOME": "/usr/lib/jvm/java-8-openjdk-amd64",
+        "ARROW_LIBHDFS_DIR": "/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib",
+        "LD_LIBRARY_PATH": "/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64/server:/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/native",
+        "CLASSPATH": "/etc/hadoop/conf:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-hdfs/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-hdfs/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-aws/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-aws/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-azure/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-azure/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/ranger-raz/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/ranger-raz/lib/*:/usr/lib/hadoop-aws/*:/usr/lib/hadoop-aws/lib/*:/usr/lib/ranger-raz/*:/usr/lib/ranger-raz/lib/*",
+        "CDP_WORKLOAD_USER": "$CML_USER"
+      }
     }
+  }
 }
