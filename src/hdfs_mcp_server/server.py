@@ -194,15 +194,22 @@ def get_user_context() -> str:
     candidate = (os.getenv("CDP_WORKLOAD_USER") or "").strip()
     # Guard against an unexpanded shell placeholder (e.g. a config that literally
     # passes "$CML_USER" without substitution) — such a value would be treated as
-    # the identity by RAZ and never match a Ranger policy.
+    # the identity by RAZ and never match a Ranger policy. Fall back through the
+    # env vars CML/Agent Studio actually set for the workload user.
     if not candidate or candidate.startswith("$"):
         if candidate.startswith("$"):
             logger.warning(
-                f"CDP_WORKLOAD_USER is unexpanded ('{candidate}'); falling back to $USER. "
-                "Ensure the platform substitutes the value (e.g. set CDP_WORKLOAD_USER "
-                "to the real workload user)."
+                f"CDP_WORKLOAD_USER is unexpanded ('{candidate}'); MCP config env values "
+                "are literal (no shell substitution). Falling back to CML_USER / "
+                "HADOOP_USER_NAME / USER."
             )
-        candidate = (os.getenv("USER") or "").strip() or "default_user"
+        for var in ("CML_USER", "HADOOP_USER_NAME", "USER"):
+            value = (os.getenv(var) or "").strip()
+            if value and not value.startswith("$"):
+                candidate = value
+                break
+        else:
+            candidate = "default_user"
     logger.info(f"Executing storage request under user context: {candidate}")
     return candidate
 
