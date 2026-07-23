@@ -32,6 +32,20 @@ For this to work:
    `HDFS_MCP_EXTRA_CONF` environment variable as comma-separated `key=value` pairs,
    e.g. `HDFS_MCP_EXTRA_CONF="fs.s3a.connection.maximum=100,fs.s3a.threads.max=64"`.
 
+### Default filesystem (optional)
+
+By default every tool call must pass a **fully-qualified URI** (e.g.
+`s3a://go01-demo/data/logs`). For single-bucket deployments you can set
+`HDFS_MCP_DEFAULT_FS` (e.g. `s3a://go01-demo`) so that **scheme-less / relative
+paths** like `/data/logs` resolve against that bucket. Fully-qualified URIs always
+take precedence over this default.
+
+```json
+"env": {
+  "HDFS_MCP_DEFAULT_FS": "s3a://go01-demo"
+}
+```
+
 ### Why the bucket is passed as `fs.defaultFS`
 
 PyArrow's `HadoopFileSystem` forces the `hdfs://` scheme onto any explicit `host`

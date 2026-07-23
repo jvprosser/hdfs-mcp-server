@@ -94,6 +94,26 @@ def build_raz_conf() -> Dict[str, str]:
     return conf
 
 
+def get_default_fs() -> str:
+    """Return the configured default filesystem authority, if any.
+
+    Set HDFS_MCP_DEFAULT_FS (e.g. 's3a://go01-demo') to allow callers to pass
+    scheme-less / relative paths (e.g. '/data/logs') that resolve against this
+    filesystem. Fully-qualified URIs always take precedence over this default.
+    """
+    default_fs = os.getenv("HDFS_MCP_DEFAULT_FS", "").strip().rstrip("/")
+    if not default_fs:
+        return ""
+
+    parsed = urlparse(default_fs)
+    if parsed.scheme.lower() not in SUPPORTED_SCHEMES or not parsed.netloc:
+        raise ValueError(
+            f"Invalid HDFS_MCP_DEFAULT_FS '{default_fs}'. Expected a fully "
+            "qualified authority such as 's3a://bucket' or 'hdfs://nameservice1'."
+        )
+    return f"{parsed.scheme.lower()}://{parsed.netloc}"
+
+
 def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
     """
     Parse a fully-qualified storage URI and return a PyArrow HadoopFileSystem
@@ -116,20 +136,36 @@ def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
     ``fs.defaultFS`` via ``extra_conf`` so libhdfs instantiates the correct
     Java FileSystem (S3A, ABFS, Ozone, or HDFS). Paths are then resolved
     relative to that default filesystem.
+
+    Scheme-less / relative paths (e.g. ``/data/logs``) are supported only when
+    HDFS_MCP_DEFAULT_FS is configured; they resolve against that filesystem.
     """
     parsed = urlparse(path_uri)
     scheme = parsed.scheme.lower()
 
-    if scheme not in SUPPORTED_SCHEMES:
-        raise ValueError(
-            f"Unsupported filesystem scheme: '{scheme}'. "
-            "Supported schemes: hdfs://, s3a://, abfs://, abfss://, ofs://"
-        )
-
-    # The authority (e.g. the S3 bucket in s3a://go01-demo/...) becomes the
-    # default filesystem. If absent (e.g. hdfs:///path) we fall back to the
-    # fs.defaultFS already configured in core-site.xml.
-    default_fs = f"{scheme}://{parsed.netloc}" if parsed.netloc else None
+    if scheme:
+        if scheme not in SUPPORTED_SCHEMES:
+            raise ValueError(
+                f"Unsupported filesystem scheme: '{scheme}'. "
+                "Supported schemes: hdfs://, s3a://, abfs://, abfss://, ofs://"
+            )
+        # The authority (e.g. the S3 bucket in s3a://go01-demo/...) becomes the
+        # default filesystem. If a scheme is given without an authority
+        # (e.g. hdfs:///path) we honor that scheme's core-site.xml fs.defaultFS
+        # rather than the HDFS_MCP_DEFAULT_FS override (which is reserved for
+        # scheme-less paths) to avoid silently redirecting to another store.
+        default_fs = f"{scheme}://{parsed.netloc}" if parsed.netloc else None
+        relative_path = parsed.path if parsed.path else "/"
+    else:
+        # No scheme: resolve the bare path against the configured default FS.
+        default_fs = get_default_fs()
+        if not default_fs:
+            raise ValueError(
+                f"Path '{path_uri}' has no filesystem scheme. Provide a fully "
+                "qualified URI (e.g. 's3a://bucket/path') or set HDFS_MCP_DEFAULT_FS."
+            )
+        rel = parsed.path or path_uri
+        relative_path = rel if rel.startswith("/") else f"/{rel}"
 
     user = get_user_context()
     cache_key = (default_fs or "default", user)
@@ -155,7 +191,6 @@ def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
             logger.error(f"Failed to initialize filesystem for {path_uri}: {str(e)}")
             raise RuntimeError(f"Storage connection failed via RAZ: {str(e)}")
 
-    relative_path = parsed.path if parsed.path else "/"
     return fs, relative_path
 
 
