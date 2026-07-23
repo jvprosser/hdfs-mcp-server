@@ -20,7 +20,7 @@ Add the following to your MCP settings inside CML / Agent Studio:
 ```json
 {
   "mcpServers": {
-    "cloudera-raz-storage": {
+    "hdfs-mcp-server": {
       "command": "uvx",
       "args": [
         "--quiet",
