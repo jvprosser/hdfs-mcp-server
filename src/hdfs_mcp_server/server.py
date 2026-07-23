@@ -10,6 +10,7 @@ import sys
 import logging
 import subprocess
 import zipfile
+import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Tuple
 from urllib.parse import urlparse
 
@@ -19,7 +20,90 @@ logger = logging.getLogger("hdfs-mcp-server")
 
 # 2. Silence log4j / Hadoop stdout output
 os.environ["HADOOP_ROOT_LOGGER"] = "WARN,console"
-os.environ["LIBHDFS_OPTS"] = "-Dlog4j.configuration=file:///dev/null"
+
+
+# 2b. TLS truststore for the libhdfs JVM.
+# The AWS SDK v2 HTTP client (used by the S3A connector) validates endpoint
+# certificates against the JVM's truststore. In a CDP RAZ environment the correct
+# truststore is Hadoop's ssl-client.xml `ssl.client.truststore.location` (the CM
+# AutoTLS global truststore), which trusts both the internal RAZ endpoint and the
+# public CAs used by S3. Without it, s3a:// access fails with
+# "SSLHandshakeException: No trusted certificate found".
+def _hadoop_ssl_truststore() -> Tuple[str, str]:
+    """Return (location, password) from ssl-client.xml, or ('', '') if not found."""
+    conf_dirs = []
+    if os.environ.get("HADOOP_CONF_DIR"):
+        conf_dirs.append(os.environ["HADOOP_CONF_DIR"])
+    conf_dirs.append("/etc/hadoop/conf")
+    seen = set()
+    for d in conf_dirs:
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        path = os.path.join(d, "ssl-client.xml")
+        if not os.path.isfile(path):
+            continue
+        try:
+            root = ET.parse(path).getroot()
+            props = {}
+            for prop in root.findall("property"):
+                name = (prop.findtext("name") or "").strip()
+                value = (prop.findtext("value") or "").strip()
+                if name:
+                    props[name] = value
+            loc = props.get("ssl.client.truststore.location", "")
+            pw = props.get("ssl.client.truststore.password", "")
+            if loc and os.path.isfile(loc):
+                return loc, pw
+        except Exception as e:
+            logger.warning(f"Failed to parse {path}: {e}")
+    return "", ""
+
+
+def _detect_truststore() -> Tuple[str, str]:
+    loc = os.getenv("HDFS_MCP_TRUSTSTORE", "").strip()
+    pw = os.getenv("HDFS_MCP_TRUSTSTORE_PASSWORD", "").strip()
+    if loc:
+        return loc, pw
+    loc, pw = _hadoop_ssl_truststore()
+    if loc:
+        return loc, pw
+    # Common CDP AutoTLS global truststore locations (trust internal + public CAs).
+    for cand in (
+        "/var/lib/cloudera-scm-agent/agent-cert/cm-auto-global_truststore.jks",
+        "/etc/cdp/security/truststore/cdp-truststore.jks",
+    ):
+        if os.path.isfile(cand):
+            return cand, pw
+    return "", pw
+
+
+def configure_jvm_options():
+    """Build LIBHDFS_OPTS without clobbering any value already set by the operator."""
+    parts: List[str] = []
+    existing = os.environ.get("LIBHDFS_OPTS", "").strip()
+    if existing:
+        parts.append(existing)
+    parts.append("-Dlog4j.configuration=file:///dev/null")
+
+    loc, pw = _detect_truststore()
+    if loc and "javax.net.ssl.trustStore" not in existing:
+        parts.append(f"-Djavax.net.ssl.trustStore={loc}")
+        if pw:
+            parts.append(f"-Djavax.net.ssl.trustStorePassword={pw}")
+        logger.info(f"Configured JVM TLS truststore: {loc}")
+    elif not loc:
+        logger.warning(
+            "No TLS truststore detected. If s3a:// fails with 'No trusted certificate "
+            "found', set HDFS_MCP_TRUSTSTORE (and HDFS_MCP_TRUSTSTORE_PASSWORD) to a "
+            "JKS/PKCS12 truststore that trusts the S3/RAZ endpoint certificates "
+            "(typically Hadoop's ssl-client.xml ssl.client.truststore.location)."
+        )
+
+    os.environ["LIBHDFS_OPTS"] = " ".join(parts)
+
+
+configure_jvm_options()
 
 # 3. Dynamically discover full Hadoop Classpath (includes HDFS, S3A, ADLS, Ozone, RAZ)
 
@@ -433,11 +517,13 @@ def diagnose_environment() -> Dict[str, Any]:
     """
     env_keys = [
         "JAVA_HOME", "HADOOP_HOME", "HADOOP_CONF_DIR", "ARROW_LIBHDFS_DIR",
-        "LD_LIBRARY_PATH", "CDP_WORKLOAD_USER", "USER",
+        "LD_LIBRARY_PATH", "LIBHDFS_OPTS", "CDP_WORKLOAD_USER", "USER", "CML_USER",
         "HDFS_MCP_DEFAULT_FS", "HDFS_MCP_AWS_SDK_DIR",
         "HDFS_MCP_EXTRA_CLASSPATH", "HDFS_MCP_CLASSPATH_SEARCH_ROOTS",
+        "HDFS_MCP_TRUSTSTORE",
     ]
     classpath = os.environ.get("CLASSPATH", "")
+    truststore_loc, _ = _detect_truststore()
 
     # Locate the marker class across all discoverable jars (authoritative check).
     marker_jars: List[str] = []
@@ -461,6 +547,8 @@ def diagnose_environment() -> Dict[str, Any]:
         "aws_sdk_marker_found": bool(marker_jars),
         "classpath_search_roots": _classpath_search_roots(),
         "jars_scanned": scanned,
+        "tls_truststore": truststore_loc or None,
+        "tls_truststore_found": bool(truststore_loc),
         "supported_schemes": list(SUPPORTED_SCHEMES),
     }
 

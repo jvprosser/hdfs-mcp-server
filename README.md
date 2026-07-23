@@ -86,6 +86,28 @@ done
 > versions can cause linkage errors. Prefer the v2 `bundle-*.jar` that matches the
 > Hadoop version.
 
+### TLS truststore (certificate validation)
+
+The AWS SDK v2 HTTP client validates the S3/RAZ endpoint certificate against the
+**JVM truststore**. In a CDP RAZ environment the correct truststore is Hadoop's
+`ssl-client.xml` → `ssl.client.truststore.location` (the CM AutoTLS global
+truststore), which trusts both the internal RAZ endpoint and the public CAs used by
+S3. Without it you get:
+
+```
+SSLHandshakeException: No trusted certificate found
+```
+
+On startup the server points the libhdfs JVM at a truststore, in this order:
+
+1. `HDFS_MCP_TRUSTSTORE` (+ `HDFS_MCP_TRUSTSTORE_PASSWORD`) if set;
+2. `ssl.client.truststore.location` from `$HADOOP_CONF_DIR/ssl-client.xml`;
+3. a known CDP AutoTLS global truststore path.
+
+It injects `-Djavax.net.ssl.trustStore[Password]` into `LIBHDFS_OPTS` (without
+clobbering any value you already set). `diagnose_environment` reports the resolved
+truststore under `tls_truststore`.
+
 ### Why the bucket is passed as `fs.defaultFS`
 
 PyArrow's `HadoopFileSystem` forces the `hdfs://` scheme onto any explicit `host`
