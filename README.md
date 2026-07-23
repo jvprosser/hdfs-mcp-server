@@ -20,20 +20,20 @@ Add the following to your MCP settings inside CML / Agent Studio:
 ```json
 {
     "mcpServers": {
-	"cloudera-raz-storage": {
-	    "command": "uvx",
+	  "hdfs-mcp-server": {
+	    "command": "uvx",        
 	    "args": [
-		"--from",
-		"git+https://github.com/jvprosser/hdfs-mcp-server.git",
-		"hdfs-mcp-server"
+		  "--from",
+		  "git+https://github.com/jvprosser/hdfs-mcp-server.git",
+		  "hdfs-mcp-server"
 	    ],
 	    "env": {
-		"HADOOP_CONF_DIR": "/etc/hadoop/conf",
-		"ARROW_LIBHDFS_DIR": "/usr/lib/hadoop/lib/native",
-		"JAVA_HOME": "/usr/lib/jvm/java-11-openjdk",
-		"CLASSPATH": "/etc/hadoop/conf:/usr/lib/hadoop/*:/usr/lib/hadoop/lib/*:/usr/lib/hadoop-hdfs/*:/usr/lib/hadoop-hdfs/lib/*",
-		"CDP_WORKLOAD_USER": "$CML_USER"
+		  "HADOOP_CONF_DIR": "/etc/hadoop/conf",
+		  "ARROW_LIBHDFS_DIR": "/usr/lib/hadoop/lib/native",
+		  "JAVA_HOME": "/usr/lib/jvm/java-11-openjdk",
+		  "CLASSPATH": "/etc/hadoop/conf:/usr/lib/hadoop/*:/usr/lib/hadoop/lib/*:/usr/lib/hadoop-hdfs/*:/usr/lib/hadoop-hdfs/lib/*",
+		  "CDP_WORKLOAD_USER": "$CML_USER"
 	    }
-	}
+	  }
     }
 }
