@@ -9,6 +9,7 @@ import os
 import sys
 import logging
 import subprocess
+import zipfile
 from typing import List, Dict, Any, Tuple
 from urllib.parse import urlparse
 
@@ -21,64 +22,118 @@ os.environ["HADOOP_ROOT_LOGGER"] = "WARN,console"
 os.environ["LIBHDFS_OPTS"] = "-Dlog4j.configuration=file:///dev/null"
 
 # 3. Dynamically discover full Hadoop Classpath (includes HDFS, S3A, ADLS, Ozone, RAZ)
-def _find_aws_sdk_classpath_dirs() -> List[str]:
-    """Locate the AWS SDK v2 shaded bundle jar and return the dirs holding it.
 
-    CDP's S3A connector uses the AWS SDK v2 (``software.amazon.awssdk``), shipped
-    as a shaded ``bundle-<version>.jar``. This jar lives in the Hadoop *tools*
-    area, which ``hadoop classpath`` does NOT include by default, producing
-    ``ClassNotFoundException: software.amazon.awssdk.transfer.s3.progress.TransferListener``
-    when instantiating an s3a:// filesystem. We locate it so it can be added to
-    the classpath the libhdfs JVM sees.
+# The exact class whose absence breaks s3a:// filesystem instantiation on CDP.
+# We locate whichever jar actually *contains* it rather than guessing by filename,
+# because CDP may ship the AWS SDK v2 either as a shaded ``bundle-*.jar`` or as
+# separate module jars (e.g. ``s3-transfer-manager-*.jar``).
+_AWS_SDK_MARKER_CLASS = "software/amazon/awssdk/transfer/s3/progress/TransferListener.class"
+_MAX_JARS_TO_SCAN = 5000
 
-    An explicit ``HDFS_MCP_AWS_SDK_DIR`` (directory containing the jar) short-
-    circuits the search.
-    """
-    override = os.getenv("HDFS_MCP_AWS_SDK_DIR", "").strip()
-    if override:
-        return [override]
 
-    # Roots most likely to contain the bundle, in preference order. We avoid
-    # scanning huge trees like /usr/lib or /opt/cloudera/parcels wholesale.
+def _classpath_search_roots() -> List[str]:
+    """Directories to scan for AWS SDK jars, in preference order (existing only)."""
     libhdfs_dir = os.environ.get("ARROW_LIBHDFS_DIR", "")
-    roots = []
+    roots: List[str] = []
     if os.environ.get("HADOOP_HOME"):
         roots.append(os.environ["HADOOP_HOME"])
     if libhdfs_dir:
-        roots.append(libhdfs_dir)                      # e.g. /runtime-addons/.../usr/lib
-        roots.append(os.path.dirname(libhdfs_dir))     # e.g. /runtime-addons/.../usr
+        roots.append(libhdfs_dir)                   # e.g. /runtime-addons/.../usr/lib
+        roots.append(os.path.dirname(libhdfs_dir))  # e.g. /runtime-addons/.../usr
     roots.append("/runtime-addons")
+    roots.append("/opt/cloudera/parcels")
+    # Allow the operator to add roots without editing this file.
+    extra = os.getenv("HDFS_MCP_CLASSPATH_SEARCH_ROOTS", "").strip()
+    if extra:
+        roots.extend(p.strip() for p in extra.split(":"))
 
-    found_dirs: List[str] = []
+    out: List[str] = []
+    seen = set()
+    for r in roots:
+        if r and r not in seen and os.path.isdir(r):
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def _list_jars(root: str, timeout: int = 30) -> List[str]:
+    try:
+        result = subprocess.run(
+            ["find", "-L", root, "-maxdepth", "10", "-type", "f", "-name", "*.jar"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+    except Exception as e:
+        logger.warning(f"jar search failed under '{root}': {e}")
+        return []
+
+
+def _jar_contains_class(jar_path: str, class_path: str) -> bool:
+    """True if the jar's central directory lists the given class entry (cheap)."""
+    try:
+        with zipfile.ZipFile(jar_path) as zf:
+            return class_path in zf.namelist()
+    except Exception:
+        return False
+
+
+def _find_aws_sdk_classpath_dirs() -> List[str]:
+    """Return classpath dirs for the AWS SDK v2, located by actual class content.
+
+    CDP's S3A connector uses AWS SDK v2 (``software.amazon.awssdk``). The jar that
+    provides ``TransferListener`` is required to instantiate an s3a:// filesystem;
+    without it you get ``ClassNotFoundException`` / ``NoClassDefFoundError`` for
+    that class. ``hadoop classpath`` does not include the SDK by default.
+
+    An explicit ``HDFS_MCP_AWS_SDK_DIR`` short-circuits discovery.
+    """
+    override = os.getenv("HDFS_MCP_AWS_SDK_DIR", "").strip()
+    if override:
+        logger.info(f"Using HDFS_MCP_AWS_SDK_DIR override for AWS SDK classpath: {override}")
+        return [override]
+
+    roots = _classpath_search_roots()
+
+    # Gather candidate jars, prioritizing AWS-SDK-looking names so we usually
+    # only need to open a handful before finding the marker class.
+    all_jars: List[str] = []
     seen = set()
     for root in roots:
-        if not root or not os.path.isdir(root) or root in seen:
-            continue
-        seen.add(root)
-        try:
-            result = subprocess.run(
-                ["find", "-L", root, "-maxdepth", "8", "-type", "f",
-                 "(", "-name", "bundle-*.jar", "-o", "-name", "aws-java-sdk-bundle-*.jar", ")"],
-                capture_output=True, text=True, timeout=20,
-            )
-        except Exception as e:
-            logger.warning(f"AWS SDK jar search failed under '{root}': {e}")
-            continue
-        for jar in filter(None, (line.strip() for line in result.stdout.splitlines())):
-            d = os.path.dirname(jar)
-            if d not in found_dirs:
-                found_dirs.append(d)
-                logger.info(f"Discovered AWS SDK bundle jar: {jar}")
-        if found_dirs:
-            break  # first root that yields a bundle is sufficient
+        for jar in _list_jars(root):
+            if jar not in seen:
+                seen.add(jar)
+                all_jars.append(jar)
 
-    if not found_dirs:
-        logger.warning(
-            "Could not locate an AWS SDK bundle jar (bundle-*.jar). s3a:// access may "
-            "fail with ClassNotFoundException for software.amazon.awssdk classes. Set "
-            "HDFS_MCP_AWS_SDK_DIR to the directory containing the jar."
+    def looks_like_aws_sdk(path: str) -> bool:
+        base = os.path.basename(path).lower()
+        return (
+            base.startswith("bundle-")
+            or "awssdk" in base
+            or "aws-sdk" in base
+            or "aws-java-sdk" in base
+            or base.startswith("s3-transfer-manager")
+            or base.startswith("s3-")
         )
-    return found_dirs
+
+    prioritized = [j for j in all_jars if looks_like_aws_sdk(j)]
+    remainder = [j for j in all_jars if not looks_like_aws_sdk(j)]
+    scan_order = (prioritized + remainder)[:_MAX_JARS_TO_SCAN]
+
+    for jar in scan_order:
+        if _jar_contains_class(jar, _AWS_SDK_MARKER_CLASS):
+            logger.info(
+                f"Located AWS SDK v2 class '{_AWS_SDK_MARKER_CLASS}' in jar: {jar}"
+            )
+            return [os.path.dirname(jar)]
+
+    logger.warning(
+        "Could not find any jar containing '%s' under %s (scanned %d jars). "
+        "s3a:// access will fail with ClassNotFoundException for the AWS SDK v2. "
+        "Set HDFS_MCP_AWS_SDK_DIR to a directory containing the AWS SDK v2 jar(s), "
+        "or HDFS_MCP_EXTRA_CLASSPATH / HDFS_MCP_CLASSPATH_SEARCH_ROOTS as needed.",
+        _AWS_SDK_MARKER_CLASS, ", ".join(roots) or "<no roots>", len(scan_order),
+    )
+    return []
 
 
 def configure_hadoop_classpath():
@@ -136,9 +191,20 @@ def get_user_context() -> str:
     identity determines which Ranger policies apply. In Cloudera Agent Studio /
     CML the workload user is exposed via CDP_WORKLOAD_USER.
     """
-    user = os.getenv("CDP_WORKLOAD_USER") or os.getenv("USER") or "default_user"
-    logger.info(f"Executing storage request under user context: {user}")
-    return user
+    candidate = (os.getenv("CDP_WORKLOAD_USER") or "").strip()
+    # Guard against an unexpanded shell placeholder (e.g. a config that literally
+    # passes "$CML_USER" without substitution) — such a value would be treated as
+    # the identity by RAZ and never match a Ranger policy.
+    if not candidate or candidate.startswith("$"):
+        if candidate.startswith("$"):
+            logger.warning(
+                f"CDP_WORKLOAD_USER is unexpanded ('{candidate}'); falling back to $USER. "
+                "Ensure the platform substitutes the value (e.g. set CDP_WORKLOAD_USER "
+                "to the real workload user)."
+            )
+        candidate = (os.getenv("USER") or "").strip() or "default_user"
+    logger.info(f"Executing storage request under user context: {candidate}")
+    return candidate
 
 
 def build_raz_conf() -> Dict[str, str]:
@@ -346,6 +412,50 @@ def open_file(
             
     except Exception as e:
         return {"error": f"Failed to read file '{path}': {str(e)}"}
+
+
+@mcp.tool()
+def diagnose_environment() -> Dict[str, Any]:
+    """
+    Report storage/classpath diagnostics for troubleshooting RAZ + S3A access.
+
+    Returns key environment variables, the effective CLASSPATH, the resolved
+    workload user, and — crucially — whether the AWS SDK v2 class required by
+    the S3A connector can be located on disk (and in which jar). Use this when
+    s3a:// access fails with ClassNotFoundException.
+    """
+    env_keys = [
+        "JAVA_HOME", "HADOOP_HOME", "HADOOP_CONF_DIR", "ARROW_LIBHDFS_DIR",
+        "LD_LIBRARY_PATH", "CDP_WORKLOAD_USER", "USER",
+        "HDFS_MCP_DEFAULT_FS", "HDFS_MCP_AWS_SDK_DIR",
+        "HDFS_MCP_EXTRA_CLASSPATH", "HDFS_MCP_CLASSPATH_SEARCH_ROOTS",
+    ]
+    classpath = os.environ.get("CLASSPATH", "")
+
+    # Locate the marker class across all discoverable jars (authoritative check).
+    marker_jars: List[str] = []
+    scanned = 0
+    for root in _classpath_search_roots():
+        for jar in _list_jars(root):
+            scanned += 1
+            if scanned > _MAX_JARS_TO_SCAN:
+                break
+            if _jar_contains_class(jar, _AWS_SDK_MARKER_CLASS):
+                if jar not in marker_jars:
+                    marker_jars.append(jar)
+
+    return {
+        "resolved_user": get_user_context(),
+        "env": {k: os.environ.get(k) for k in env_keys},
+        "classpath_entry_count": len([p for p in classpath.split(":") if p]),
+        "classpath": classpath,
+        "aws_sdk_marker_class": _AWS_SDK_MARKER_CLASS,
+        "aws_sdk_marker_jars": marker_jars,
+        "aws_sdk_marker_found": bool(marker_jars),
+        "classpath_search_roots": _classpath_search_roots(),
+        "jars_scanned": scanned,
+        "supported_schemes": list(SUPPORTED_SCHEMES),
+    }
 
 
 def main():

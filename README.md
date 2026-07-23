@@ -59,17 +59,26 @@ filesystem otherwise fails with:
 ClassNotFoundException: software.amazon.awssdk.transfer.s3.progress.TransferListener
 ```
 
-On startup the server searches `HADOOP_HOME`, `ARROW_LIBHDFS_DIR` (and its parent),
-and `/runtime-addons` for `bundle-*.jar` / `aws-java-sdk-bundle-*.jar` and adds the
-containing directory to the classpath. If your layout differs:
+On startup the server scans `HADOOP_HOME`, `ARROW_LIBHDFS_DIR` (and its parent),
+`/runtime-addons`, and `/opt/cloudera/parcels` and locates the **jar that actually
+contains** `software/amazon/awssdk/transfer/s3/progress/TransferListener.class`
+(matching by class content, not filename, since CDP may ship the SDK either as a
+shaded `bundle-*.jar` or as separate module jars like `s3-transfer-manager-*.jar`).
+The directory holding that jar is added to the classpath. If your layout differs:
 
-* Set `HDFS_MCP_AWS_SDK_DIR` to the directory that contains the bundle jar, **or**
+* Set `HDFS_MCP_AWS_SDK_DIR` to the directory that contains the AWS SDK jar(s), **or**
+* Set `HDFS_MCP_CLASSPATH_SEARCH_ROOTS` (colon-separated) to add search roots, **or**
 * Set `HDFS_MCP_EXTRA_CLASSPATH` to any extra classpath entries to append.
+
+Use the **`diagnose_environment`** tool to see the effective `CLASSPATH`, resolved
+workload user, and whether the required AWS SDK class was located (and in which jar).
 
 To locate it manually in your environment:
 
 ```bash
-find / -name 'bundle-*.jar' 2>/dev/null | grep -Ei 'aws|awssdk'
+for j in $(find / -name '*.jar' 2>/dev/null); do \
+  unzip -l "$j" 2>/dev/null | grep -q 'transfer/s3/progress/TransferListener' && echo "FOUND: $j"; \
+done
 ```
 
 > Do not put both the AWS SDK **v1** (`aws-java-sdk-bundle-*.jar`) and **v2**
