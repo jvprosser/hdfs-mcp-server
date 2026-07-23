@@ -1,19 +1,19 @@
 {
     "mcpServers": {
-	  "hdfs-mcp-server": {
-	    "command": "uvx",        
-	    "args": [
-		  "--from",
-		  "git+https://github.com/jvprosser/hdfs-mcp-server.git",
-		  "hdfs-mcp-server"
-	    ],
-	    "env": {
-		  "HADOOP_CONF_DIR": "/etc/hadoop/conf",
-		  "ARROW_LIBHDFS_DIR": "/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib",
-		  "JAVA_HOME": "/usr/lib/jvm/java-8-openjdk-amd64",
-		  "CLASSPATH": "/etc/hadoop/conf:/usr/lib/hadoop/*:/usr/lib/hadoop/lib/*:/usr/lib/hadoop-hdfs/*:/usr/lib/hadoop-hdfs/lib/*",
-		  "CDP_WORKLOAD_USER": "$CML_USER"
-	    }
-	  }
+      "hdfs-mcp-server": {
+        "command": "uvx",        
+        "args": [
+          "--from",
+          "git+https://github.com/jvprosser/hdfs-mcp-server.git",
+          "hdfs-mcp-server"
+        ],
+        "env": {
+          "HADOOP_CONF_DIR": "/etc/hadoop/conf",
+          "ARROW_LIBHDFS_DIR": "/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib",
+          "JAVA_HOME": "/usr/lib/jvm/java-8-openjdk-amd64",
+          "CLASSPATH": "/etc/hadoop/conf:/usr/lib/hadoop/*:/usr/lib/hadoop/lib/*:/usr/lib/hadoop-hdfs/*:/usr/lib/hadoop-hdfs/lib/*",
+          "CDP_WORKLOAD_USER": "$CML_USER"
+        }
+      }
     }
 }
