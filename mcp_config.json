@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "cloudera-raz-storage": {
+    "hdfs-mcp-server": {
       "command": "uvx",
       "args": [
         "--quiet",
