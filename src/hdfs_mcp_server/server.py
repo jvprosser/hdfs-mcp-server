@@ -6,6 +6,7 @@
 # ///
 
 import os
+import re
 import sys
 import glob
 import shutil
@@ -126,7 +127,13 @@ def _candidate_java_homes() -> List[str]:
 
 
 def _default_cacerts() -> str:
-    """Path to a usable JVM cacerts keystore (sandbox-aware)."""
+    """Path to a usable JVM cacerts *keystore* (JKS/PKCS12), sandbox-aware.
+
+    Preferred because copying one file preserves the full public (+ any internal)
+    trust set cheaply. Note: os.path.isfile() follows symlinks, so a dangling
+    symlink (e.g. Debian's /etc/ssl/certs/java/cacerts -> unmounted target) is
+    correctly treated as absent.
+    """
     for home in _candidate_java_homes():
         for p in (
             os.path.join(home, "jre", "lib", "security", "cacerts"),
@@ -134,8 +141,13 @@ def _default_cacerts() -> str:
         ):
             if os.path.isfile(p):
                 return p
-    if os.path.isfile("/etc/ssl/certs/java/cacerts"):
-        return "/etc/ssl/certs/java/cacerts"
+    for p in (
+        "/etc/ssl/certs/java/cacerts",               # Debian/Ubuntu (ca-certificates-java)
+        "/etc/pki/ca-trust/extracted/java/cacerts",  # RHEL/CentOS/Rocky
+        "/etc/pki/java/cacerts",                      # older RHEL
+    ):
+        if os.path.isfile(p):
+            return p
     return ""
 
 
@@ -190,6 +202,55 @@ def _ca_pem_files() -> List[str]:
     return out
 
 
+def _ca_bundle_files() -> List[str]:
+    """Concatenated PEM CA *bundle* files (many certs in one file).
+
+    These hold the full public root set. keytool can't import a multi-cert PEM in
+    one shot, so we split them (see _split_pem_bundle) and import each cert. Used
+    as the base when no JVM cacerts keystore is available, so we don't lose trust
+    for non-AWS public endpoints (Azure/abfs, etc.). Override/disable with
+    HDFS_MCP_CA_BUNDLE (colon-separated; set to 'none' to disable).
+    """
+    env = os.getenv("HDFS_MCP_CA_BUNDLE", "").strip()
+    if env.lower() == "none":
+        return []
+    if env:
+        cands = [x.strip() for x in env.split(":") if x.strip()]
+    else:
+        cands = [
+            "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu
+            "/etc/pki/tls/certs/ca-bundle.crt",    # RHEL/CentOS
+            "/etc/ssl/ca-bundle.pem",              # SUSE
+        ]
+    return [c for c in cands if os.path.isfile(c)]
+
+
+def _split_pem_bundle(path: str) -> List[str]:
+    """Split a concatenated PEM bundle into individual cert files in a temp dir."""
+    try:
+        with open(path, "r", errors="ignore") as f:
+            data = f.read()
+    except Exception as e:
+        logger.warning(f"Could not read CA bundle {path}: {e}")
+        return []
+    blocks = re.findall(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", data, re.DOTALL
+    )
+    if not blocks:
+        return []
+    out: List[str] = []
+    d = tempfile.mkdtemp(prefix="hdfs-mcp-cabundle-")
+    for i, block in enumerate(blocks):
+        p = os.path.join(d, f"cert_{i}.pem")
+        try:
+            with open(p, "w") as fh:
+                fh.write(block.strip() + "\n")
+            out.append(p)
+        except Exception:
+            continue
+    return out
+
+
 def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str = "") -> str:
     """Create a truststore = base cacerts + public CA PEMs (+ optional internal JKS).
 
@@ -200,8 +261,25 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
     have_base = bool(base_cacerts and os.path.isfile(base_cacerts))
     have_merge = bool(merge_jks and os.path.isfile(merge_jks))
 
+    # When there's no JVM cacerts keystore to seed from, fall back to the system
+    # PEM CA bundle (full public root set) so we don't narrow trust to just the
+    # bundled AWS roots. Skipped when have_base, since the base already carries
+    # the full public set (avoids ~130 extra keytool calls).
+    bundle_pems: List[str] = []
+    if not have_base:
+        for bundle in _ca_bundle_files():
+            certs = _split_pem_bundle(bundle)
+            if certs:
+                logger.info(
+                    f"No JVM cacerts base; importing {len(certs)} CA certs from "
+                    f"system bundle {bundle} to preserve full public trust."
+                )
+                bundle_pems.extend(certs)
+
+    import_pems = pem_files + bundle_pems
+
     # Nothing to work with at all.
-    if not pem_files and not have_base and not have_merge:
+    if not import_pems and not have_base and not have_merge:
         logger.warning("Truststore build skipped: no base cacerts, no CA PEMs, no internal truststore.")
         return ""
 
@@ -229,25 +307,26 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
                 logger.warning(f"Could not merge internal truststore '{merge_jks}': {r.stderr.strip()}")
 
         imported = 0
-        last_out = ""
-        for pem in pem_files:
-            alias = "hdfsmcp_" + os.path.splitext(os.path.basename(pem))[0]
+        last_err = ""
+        for i, pem in enumerate(import_pems):
+            alias = f"hdfsmcp_{i}"
             r = subprocess.run(
                 [keytool, "-importcert", "-noprompt", "-trustcacerts",
                  "-alias", alias, "-file", pem,
                  "-keystore", _TRUSTSTORE_CACHE, "-storepass", _DEFAULT_STOREPASS],
                 capture_output=True, text=True, timeout=60,
             )
-            last_out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+            out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
             # Success is only real if the certificate was added AND the store was
             # persisted to disk. Some JDKs (Java 8) return non-zero even on a
             # genuine add, so we confirm by checking the file exists afterwards.
-            if "added to keystore" in last_out.lower() and os.path.isfile(_TRUSTSTORE_CACHE):
-                imported += 1
-            elif r.returncode == 0 and os.path.isfile(_TRUSTSTORE_CACHE):
+            if os.path.isfile(_TRUSTSTORE_CACHE) and (
+                "added to keystore" in out.lower() or r.returncode == 0
+            ):
                 imported += 1
             else:
-                logger.warning(f"keytool could not import {pem} (exit={r.returncode}): {last_out}")
+                last_err = out
+                logger.warning(f"keytool could not import {pem} (exit={r.returncode}): {out}")
 
         # Verify the built store actually contains entries.
         entries = _truststore_entry_count(_TRUSTSTORE_CACHE, keytool)
@@ -257,16 +336,17 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
         if not usable:
             logger.warning(
                 f"Truststore build produced no usable store at {_TRUSTSTORE_CACHE} "
-                f"(imported={imported}, verified_entries={entries}, "
+                f"(imported={imported}/{len(import_pems)}, verified_entries={entries}, "
                 f"file_exists={os.path.isfile(_TRUSTSTORE_CACHE)}). "
-                f"Last keytool output: {last_out}"
+                f"Last keytool output: {last_err}"
             )
             return ""
 
         logger.info(
             f"Built TLS truststore {_TRUSTSTORE_CACHE} "
             f"(base={base_cacerts if have_base else 'NONE(from-scratch)'}, "
-            f"+{imported}/{len(pem_files)} PEM CAs"
+            f"+{imported}/{len(import_pems)} PEM CAs "
+            f"[{len(pem_files)} individual + {len(bundle_pems)} from system bundle]"
             f"{', merged ' + merge_jks if have_merge else ''}, "
             f"total_entries={entries}) via keytool={keytool}."
         )
@@ -319,12 +399,13 @@ def _resolve_truststore() -> Tuple[str, str]:
 
     base = _default_cacerts()
     logger.info(
-        "TLS truststore resolve [v3-writable-cache]: "
+        "TLS truststore resolve [v4-system-ca]: "
         f"cache_path={_TRUSTSTORE_CACHE!r} (TMPDIR={os.environ.get('TMPDIR')!r}, "
         f"gettempdir={tempfile.gettempdir()!r}), "
         f"JAVA_HOME={os.environ.get('JAVA_HOME')!r}, base_cacerts={base or 'NONE'!r}, "
         f"keytool={_keytool()!r}, candidate_java_homes={_candidate_java_homes()}, "
-        f"pem_files={_ca_pem_files()}, internal_truststore={internal_loc or 'NONE'!r}"
+        f"individual_pems={_ca_pem_files()}, system_ca_bundles={_ca_bundle_files()}, "
+        f"internal_truststore={internal_loc or 'NONE'!r}"
     )
     built = _build_truststore(base, merge_jks=internal_loc, merge_jks_pw=internal_pw)
     if built:
@@ -817,6 +898,7 @@ def diagnose_environment() -> Dict[str, Any]:
         "tls_truststore": truststore_loc or None,
         "tls_truststore_found": bool(truststore_loc),
         "tls_ca_pem_files": _ca_pem_files(),
+        "tls_system_ca_bundles": _ca_bundle_files(),
         "tls_base_cacerts": _default_cacerts() or None,
         "tls_keytool": _keytool(),
         "tls_candidate_java_homes": _candidate_java_homes(),
