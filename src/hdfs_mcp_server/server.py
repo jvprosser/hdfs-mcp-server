@@ -482,14 +482,22 @@ def _find_aws_sdk_classpath_dirs() -> List[str]:
 def configure_hadoop_classpath():
     parts: List[str] = ["/etc/hadoop/conf"]  # site XMLs take priority
 
-    try:
-        result = subprocess.run(
-            ["hadoop", "classpath", "--glob"], capture_output=True, text=True, check=True
-        )
-        parts.append(result.stdout.strip())
-        logger.info("Configured Hadoop CLASSPATH via 'hadoop classpath --glob'")
-    except Exception as e:
-        logger.warning(f"Could not execute 'hadoop classpath --glob': {e}. Relying on environment CLASSPATH.")
+    # 'hadoop classpath --glob' is only a fallback for plain edge nodes where the
+    # hadoop CLI is on PATH but CLASSPATH isn't pre-set. In Agent Studio the
+    # hadoop binary isn't on PATH and CLASSPATH is provided via env, so skip the
+    # call quietly instead of emitting an alarming warning.
+    hadoop_bin = shutil.which("hadoop")
+    if hadoop_bin:
+        try:
+            result = subprocess.run(
+                [hadoop_bin, "classpath", "--glob"], capture_output=True, text=True, check=True
+            )
+            parts.append(result.stdout.strip())
+            logger.info("Configured Hadoop CLASSPATH via 'hadoop classpath --glob'")
+        except Exception as e:
+            logger.warning(f"'hadoop classpath --glob' failed: {e}. Relying on environment CLASSPATH.")
+    else:
+        logger.info("hadoop CLI not on PATH; using environment CLASSPATH (expected in Agent Studio).")
 
     # Ensure the AWS SDK v2 bundle is present (required by the S3A connector).
     for d in _find_aws_sdk_classpath_dirs():
