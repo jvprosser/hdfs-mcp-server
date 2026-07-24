@@ -256,8 +256,22 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
 
     Returns the path to the built truststore (password _DEFAULT_STOREPASS), or "".
     """
-    pem_files = _ca_pem_files()
     keytool = _keytool()
+
+    # Reuse a previously built store. Agent Studio spawns a fresh MCP process per
+    # task, so without this we'd re-import ~150 CAs on every request. The cache
+    # lives in TMPDIR (which persists across invocations) and is only ever created
+    # via an atomic move below, so if it exists it's complete and valid.
+    if os.path.isfile(_TRUSTSTORE_CACHE):
+        n = _truststore_entry_count(_TRUSTSTORE_CACHE, keytool)
+        if n > 0:
+            logger.info(
+                f"Reusing existing TLS truststore {_TRUSTSTORE_CACHE} ({n} entries); "
+                f"skipping rebuild."
+            )
+            return _TRUSTSTORE_CACHE
+
+    pem_files = _ca_pem_files()
     have_base = bool(base_cacerts and os.path.isfile(base_cacerts))
     have_merge = bool(merge_jks and os.path.isfile(merge_jks))
 
@@ -283,24 +297,25 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
         logger.warning("Truststore build skipped: no base cacerts, no CA PEMs, no internal truststore.")
         return ""
 
+    # Build into a unique temp file, then atomically move into place. This avoids
+    # alias collisions and races when multiple task processes build concurrently.
+    fd, tmp_store = tempfile.mkstemp(prefix="hdfs-mcp-ts-", suffix=".jks")
+    os.close(fd)
+    os.remove(tmp_store)  # keytool creates it; a pre-existing empty file breaks import
+
     try:
-        # Seed the destination store: prefer the JVM's cacerts (keeps existing
-        # public + RAZ trust). If it isn't reachable (e.g. restricted sandbox),
-        # build from scratch — keytool -importcert creates the store on demand.
         if have_base:
-            shutil.copyfile(base_cacerts, _TRUSTSTORE_CACHE)
+            shutil.copyfile(base_cacerts, tmp_store)
             try:
-                os.chmod(_TRUSTSTORE_CACHE, 0o644)
+                os.chmod(tmp_store, 0o644)
             except OSError:
                 pass
-        elif os.path.exists(_TRUSTSTORE_CACHE):
-            os.remove(_TRUSTSTORE_CACHE)
 
         if have_merge:
             r = subprocess.run(
                 [keytool, "-importkeystore", "-noprompt",
                  "-srckeystore", merge_jks, "-srcstorepass", merge_jks_pw or _DEFAULT_STOREPASS,
-                 "-destkeystore", _TRUSTSTORE_CACHE, "-deststorepass", _DEFAULT_STOREPASS],
+                 "-destkeystore", tmp_store, "-deststorepass", _DEFAULT_STOREPASS],
                 capture_output=True, text=True, timeout=60,
             )
             if r.returncode != 0:
@@ -313,35 +328,35 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
             r = subprocess.run(
                 [keytool, "-importcert", "-noprompt", "-trustcacerts",
                  "-alias", alias, "-file", pem,
-                 "-keystore", _TRUSTSTORE_CACHE, "-storepass", _DEFAULT_STOREPASS],
+                 "-keystore", tmp_store, "-storepass", _DEFAULT_STOREPASS],
                 capture_output=True, text=True, timeout=60,
             )
-            out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
-            # Success is only real if the certificate was added AND the store was
-            # persisted to disk. Some JDKs (Java 8) return non-zero even on a
-            # genuine add, so we confirm by checking the file exists afterwards.
-            if os.path.isfile(_TRUSTSTORE_CACHE) and (
-                "added to keystore" in out.lower() or r.returncode == 0
+            out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip().lower()
+            # Java 8 keytool can return non-zero even on a genuine add; and a
+            # duplicate cert ("already exists") is harmless. Treat both as success
+            # as long as the store file exists.
+            if os.path.isfile(tmp_store) and (
+                "added to keystore" in out or "already exists" in out or r.returncode == 0
             ):
                 imported += 1
             else:
                 last_err = out
                 logger.warning(f"keytool could not import {pem} (exit={r.returncode}): {out}")
 
-        # Verify the built store actually contains entries.
-        entries = _truststore_entry_count(_TRUSTSTORE_CACHE, keytool)
-        usable = os.path.isfile(_TRUSTSTORE_CACHE) and (
+        entries = _truststore_entry_count(tmp_store, keytool)
+        usable = os.path.isfile(tmp_store) and (
             entries > 0 or imported > 0 or have_base or have_merge
         )
         if not usable:
             logger.warning(
-                f"Truststore build produced no usable store at {_TRUSTSTORE_CACHE} "
+                f"Truststore build produced no usable store "
                 f"(imported={imported}/{len(import_pems)}, verified_entries={entries}, "
-                f"file_exists={os.path.isfile(_TRUSTSTORE_CACHE)}). "
-                f"Last keytool output: {last_err}"
+                f"file_exists={os.path.isfile(tmp_store)}). Last keytool output: {last_err}"
             )
             return ""
 
+        # Atomically publish the completed store (last writer wins; both complete).
+        os.replace(tmp_store, _TRUSTSTORE_CACHE)
         logger.info(
             f"Built TLS truststore {_TRUSTSTORE_CACHE} "
             f"(base={base_cacerts if have_base else 'NONE(from-scratch)'}, "
@@ -354,6 +369,16 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
     except Exception as e:
         logger.warning(f"Failed to build merged truststore: {e}")
         return ""
+    finally:
+        if os.path.isfile(tmp_store):
+            try:
+                os.remove(tmp_store)
+            except OSError:
+                pass
+        # Remove temp dirs holding the split system-bundle certs.
+        for d in {os.path.dirname(p) for p in bundle_pems}:
+            if d and os.path.basename(d).startswith("hdfs-mcp-cabundle-"):
+                shutil.rmtree(d, ignore_errors=True)
 
 
 def _truststore_entry_count(store: str, keytool: str) -> int:
