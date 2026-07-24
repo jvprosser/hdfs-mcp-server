@@ -168,18 +168,29 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
     Returns the path to the built truststore (password _DEFAULT_STOREPASS), or "".
     """
     pem_files = _ca_pem_files()
-    if not pem_files and not merge_jks:
+    keytool = _keytool()
+    have_base = bool(base_cacerts and os.path.isfile(base_cacerts))
+    have_merge = bool(merge_jks and os.path.isfile(merge_jks))
+
+    # Nothing to work with at all.
+    if not pem_files and not have_base and not have_merge:
+        logger.warning("Truststore build skipped: no base cacerts, no CA PEMs, no internal truststore.")
         return ""
 
-    keytool = _keytool()
     try:
-        shutil.copyfile(base_cacerts, _TRUSTSTORE_CACHE)
-        try:
-            os.chmod(_TRUSTSTORE_CACHE, 0o644)
-        except OSError:
-            pass
+        # Seed the destination store: prefer the JVM's cacerts (keeps existing
+        # public + RAZ trust). If it isn't reachable (e.g. restricted sandbox),
+        # build from scratch — keytool -importcert creates the store on demand.
+        if have_base:
+            shutil.copyfile(base_cacerts, _TRUSTSTORE_CACHE)
+            try:
+                os.chmod(_TRUSTSTORE_CACHE, 0o644)
+            except OSError:
+                pass
+        elif os.path.exists(_TRUSTSTORE_CACHE):
+            os.remove(_TRUSTSTORE_CACHE)
 
-        if merge_jks and os.path.isfile(merge_jks):
+        if have_merge:
             r = subprocess.run(
                 [keytool, "-importkeystore", "-noprompt",
                  "-srckeystore", merge_jks, "-srcstorepass", merge_jks_pw or _DEFAULT_STOREPASS,
@@ -200,10 +211,18 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
             )
             if r.returncode == 0:
                 imported += 1
+            else:
+                logger.warning(f"keytool failed to import {pem}: {r.stderr.strip()}")
+
+        if not os.path.isfile(_TRUSTSTORE_CACHE) or (not have_base and not have_merge and imported == 0):
+            logger.warning("Truststore build produced no usable store (no base, no merges, 0 PEMs imported).")
+            return ""
+
         logger.info(
             f"Built TLS truststore {_TRUSTSTORE_CACHE} "
-            f"(base={base_cacerts}, +{imported}/{len(pem_files)} PEM CAs"
-            f"{', merged ' + merge_jks if merge_jks else ''})."
+            f"(base={base_cacerts if have_base else 'NONE(from-scratch)'}, "
+            f"+{imported}/{len(pem_files)} PEM CAs"
+            f"{', merged ' + merge_jks if have_merge else ''}) via keytool={keytool}."
         )
         return _TRUSTSTORE_CACHE
     except Exception as e:
@@ -229,10 +248,15 @@ def _resolve_truststore() -> Tuple[str, str]:
                 break
 
     base = _default_cacerts()
-    if base:
-        built = _build_truststore(base, merge_jks=internal_loc, merge_jks_pw=internal_pw)
-        if built:
-            return built, _DEFAULT_STOREPASS
+    logger.info(
+        "TLS truststore resolve [v2-bundled-ca]: "
+        f"JAVA_HOME={os.environ.get('JAVA_HOME')!r}, base_cacerts={base or 'NONE'!r}, "
+        f"keytool={_keytool()!r}, candidate_java_homes={_candidate_java_homes()}, "
+        f"pem_files={_ca_pem_files()}, internal_truststore={internal_loc or 'NONE'!r}"
+    )
+    built = _build_truststore(base, merge_jks=internal_loc, merge_jks_pw=internal_pw)
+    if built:
+        return built, _DEFAULT_STOREPASS
 
     # Fall back to whatever internal truststore we found, else nothing.
     if internal_loc:

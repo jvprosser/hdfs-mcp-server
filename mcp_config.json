@@ -4,6 +4,7 @@
       "command": "uvx",
       "args": [
         "--quiet",
+        "--no-cache",
         "--refresh",
         "--reinstall",
         "--from",
