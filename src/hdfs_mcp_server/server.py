@@ -10,6 +10,7 @@ import sys
 import glob
 import shutil
 import logging
+import tempfile
 import subprocess
 import zipfile
 import xml.etree.ElementTree as ET
@@ -63,7 +64,34 @@ def _hadoop_ssl_truststore() -> Tuple[str, str]:
 
 
 _DEFAULT_STOREPASS = "changeit"
-_TRUSTSTORE_CACHE = os.getenv("HDFS_MCP_TRUSTSTORE_CACHE", "/tmp/hdfs-mcp-truststore.jks")
+
+
+def _default_truststore_cache() -> str:
+    """A writable path for the built truststore.
+
+    The Agent Studio bubblewrap sandbox does NOT make /tmp writable — its writable
+    temp is TMPDIR (e.g. /workspace/tmp), which is also where the package itself is
+    unpacked. Honor tempfile.gettempdir() (which respects TMPDIR/TEMP/TMP) instead
+    of hardcoding /tmp, falling back through a few candidates.
+    """
+    candidates = [
+        os.environ.get("HDFS_MCP_TRUSTSTORE_CACHE", ""),
+        os.path.join(tempfile.gettempdir(), "hdfs-mcp-truststore.jks"),
+        os.path.join(os.environ.get("TMPDIR", "").rstrip("/"), "hdfs-mcp-truststore.jks")
+        if os.environ.get("TMPDIR") else "",
+        "/tmp/hdfs-mcp-truststore.jks",
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        d = os.path.dirname(c) or "."
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return c
+    # Last resort: let tempfile pick a guaranteed-writable dir.
+    return os.path.join(tempfile.mkdtemp(prefix="hdfs-mcp-"), "hdfs-mcp-truststore.jks")
+
+
+_TRUSTSTORE_CACHE = _default_truststore_cache()
 # Populated by configure_jvm_options(); surfaced via diagnose_environment().
 _ACTIVE_TRUSTSTORE = ""
 
@@ -201,6 +229,7 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
                 logger.warning(f"Could not merge internal truststore '{merge_jks}': {r.stderr.strip()}")
 
         imported = 0
+        last_out = ""
         for pem in pem_files:
             alias = "hdfsmcp_" + os.path.splitext(os.path.basename(pem))[0]
             r = subprocess.run(
@@ -209,27 +238,28 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
                  "-keystore", _TRUSTSTORE_CACHE, "-storepass", _DEFAULT_STOREPASS],
                 capture_output=True, text=True, timeout=60,
             )
-            # Some JDKs (e.g. Java 8 in the CDP sandbox) return a non-zero exit
-            # code even though the import succeeded ("Certificate was added to
-            # keystore"). Trust the output message over the exit code.
-            out = ((r.stdout or "") + (r.stderr or "")).lower()
-            if r.returncode == 0 or "added to keystore" in out:
+            last_out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+            # Success is only real if the certificate was added AND the store was
+            # persisted to disk. Some JDKs (Java 8) return non-zero even on a
+            # genuine add, so we confirm by checking the file exists afterwards.
+            if "added to keystore" in last_out.lower() and os.path.isfile(_TRUSTSTORE_CACHE):
+                imported += 1
+            elif r.returncode == 0 and os.path.isfile(_TRUSTSTORE_CACHE):
                 imported += 1
             else:
-                logger.warning(f"keytool failed to import {pem}: {r.stderr.strip()}")
+                logger.warning(f"keytool could not import {pem} (exit={r.returncode}): {last_out}")
 
-        # Verify the built store actually contains entries, regardless of the
-        # per-import exit codes. entries == -1 means "-list" couldn't be parsed
-        # (also a possible Java 8 quirk) — in that case fall back to whether any
-        # import reported success or we started from a base/merge.
+        # Verify the built store actually contains entries.
         entries = _truststore_entry_count(_TRUSTSTORE_CACHE, keytool)
         usable = os.path.isfile(_TRUSTSTORE_CACHE) and (
             entries > 0 or imported > 0 or have_base or have_merge
         )
         if not usable:
             logger.warning(
-                f"Truststore build produced no usable store "
-                f"(imported={imported}, verified_entries={entries})."
+                f"Truststore build produced no usable store at {_TRUSTSTORE_CACHE} "
+                f"(imported={imported}, verified_entries={entries}, "
+                f"file_exists={os.path.isfile(_TRUSTSTORE_CACHE)}). "
+                f"Last keytool output: {last_out}"
             )
             return ""
 
@@ -289,7 +319,9 @@ def _resolve_truststore() -> Tuple[str, str]:
 
     base = _default_cacerts()
     logger.info(
-        "TLS truststore resolve [v2-bundled-ca]: "
+        "TLS truststore resolve [v3-writable-cache]: "
+        f"cache_path={_TRUSTSTORE_CACHE!r} (TMPDIR={os.environ.get('TMPDIR')!r}, "
+        f"gettempdir={tempfile.gettempdir()!r}), "
         f"JAVA_HOME={os.environ.get('JAVA_HOME')!r}, base_cacerts={base or 'NONE'!r}, "
         f"keytool={_keytool()!r}, candidate_java_homes={_candidate_java_homes()}, "
         f"pem_files={_ca_pem_files()}, internal_truststore={internal_loc or 'NONE'!r}"
