@@ -98,15 +98,31 @@ S3. Without it you get:
 SSLHandshakeException: No trusted certificate found
 ```
 
-On startup the server points the libhdfs JVM at a truststore, in this order:
+Some CDP runtimes ship a **reduced `ca-certificates-java` keystore that omits public
+roots** (e.g. Amazon/Starfield) that AWS S3 endpoints chain to — so the default
+`cacerts` fails even for public S3, even though the individual PEM files exist under
+`/etc/ssl/certs`.
 
-1. `HDFS_MCP_TRUSTSTORE` (+ `HDFS_MCP_TRUSTSTORE_PASSWORD`) if set;
-2. `ssl.client.truststore.location` from `$HADOOP_CONF_DIR/ssl-client.xml`;
-3. a known CDP AutoTLS global truststore path.
+On startup the server resolves a truststore as follows:
+
+1. If `HDFS_MCP_TRUSTSTORE` (+ `HDFS_MCP_TRUSTSTORE_PASSWORD`) is set, use it as-is.
+2. Otherwise it **builds** a truststore (cached at `HDFS_MCP_TRUSTSTORE_CACHE`,
+   default `/tmp/hdfs-mcp-truststore.jks`) = a copy of the JVM's `cacerts`, **plus**
+   public CA PEMs (default globs `Amazon_Root_CA_*.pem` + `Starfield_*.pem` under
+   `/etc/ssl/certs`), **plus** any internal/CM truststore (`ssl-client.xml`
+   `ssl.client.truststore.location` or a known CDP AutoTLS path) so the RAZ endpoint
+   stays trusted.
 
 It injects `-Djavax.net.ssl.trustStore[Password]` into `LIBHDFS_OPTS` (without
 clobbering any value you already set). `diagnose_environment` reports the resolved
-truststore under `tls_truststore`.
+truststore under `tls_truststore` and the imported PEMs under `tls_ca_pem_files`.
+
+Related overrides:
+
+* `HDFS_MCP_CA_PEM_GLOBS` — colon-separated globs of CA PEM files to import
+  (defaults to Amazon/Starfield). Widen this for other clouds (ADLS/GCS).
+* `HDFS_MCP_EXTRA_CA_PEM` — colon-separated extra CA PEM files or directories
+  (e.g. an internal RAZ CA).
 
 ### Why the bucket is passed as `fs.defaultFS`
 

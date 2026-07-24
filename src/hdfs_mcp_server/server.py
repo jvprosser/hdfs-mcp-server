@@ -7,6 +7,8 @@
 
 import os
 import sys
+import glob
+import shutil
 import logging
 import subprocess
 import zipfile
@@ -60,44 +62,167 @@ def _hadoop_ssl_truststore() -> Tuple[str, str]:
     return "", ""
 
 
-def _detect_truststore() -> Tuple[str, str]:
-    loc = os.getenv("HDFS_MCP_TRUSTSTORE", "").strip()
-    pw = os.getenv("HDFS_MCP_TRUSTSTORE_PASSWORD", "").strip()
-    if loc:
-        return loc, pw
-    loc, pw = _hadoop_ssl_truststore()
-    if loc:
-        return loc, pw
-    # Common CDP AutoTLS global truststore locations (trust internal + public CAs).
-    for cand in (
-        "/var/lib/cloudera-scm-agent/agent-cert/cm-auto-global_truststore.jks",
-        "/etc/cdp/security/truststore/cdp-truststore.jks",
+_DEFAULT_STOREPASS = "changeit"
+_TRUSTSTORE_CACHE = os.getenv("HDFS_MCP_TRUSTSTORE_CACHE", "/tmp/hdfs-mcp-truststore.jks")
+# Populated by configure_jvm_options(); surfaced via diagnose_environment().
+_ACTIVE_TRUSTSTORE = ""
+
+
+def _default_cacerts() -> str:
+    """Path to the JVM's default cacerts keystore."""
+    java_home = os.environ.get("JAVA_HOME", "")
+    for p in (
+        os.path.join(java_home, "jre", "lib", "security", "cacerts") if java_home else "",
+        os.path.join(java_home, "lib", "security", "cacerts") if java_home else "",
+        "/etc/ssl/certs/java/cacerts",
     ):
-        if os.path.isfile(cand):
-            return cand, pw
-    return "", pw
+        if p and os.path.isfile(p):
+            return p
+    return ""
+
+
+def _keytool() -> str:
+    java_home = os.environ.get("JAVA_HOME", "")
+    candidate = os.path.join(java_home, "bin", "keytool") if java_home else ""
+    return candidate if candidate and os.path.isfile(candidate) else "keytool"
+
+
+def _ca_pem_files() -> List[str]:
+    """PEM CA files to add to the truststore.
+
+    The reduced ``ca-certificates-java`` keystore in some CDP runtimes omits public
+    roots (e.g. Amazon/Starfield) that AWS S3 endpoints chain to, even though the
+    individual PEM files exist under /etc/ssl/certs. Import those. Additional CAs
+    (e.g. an internal RAZ CA) can be supplied via HDFS_MCP_EXTRA_CA_PEM.
+    """
+    globs_env = os.getenv("HDFS_MCP_CA_PEM_GLOBS", "").strip()
+    if globs_env:
+        patterns = [g.strip() for g in globs_env.split(":") if g.strip()]
+    else:
+        patterns = [
+            "/etc/ssl/certs/Amazon_Root_CA_*.pem",
+            "/etc/ssl/certs/Starfield_*.pem",
+        ]
+
+    files: List[str] = []
+    for pat in patterns:
+        files.extend(sorted(glob.glob(pat)))
+
+    extra = os.getenv("HDFS_MCP_EXTRA_CA_PEM", "").strip()
+    for item in (x.strip() for x in extra.split(":") if x.strip()):
+        if os.path.isdir(item):
+            files.extend(sorted(glob.glob(os.path.join(item, "*.pem"))))
+            files.extend(sorted(glob.glob(os.path.join(item, "*.crt"))))
+        elif os.path.isfile(item):
+            files.append(item)
+
+    seen, out = set(), []
+    for f in files:
+        if f not in seen and os.path.isfile(f):
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str = "") -> str:
+    """Create a truststore = base cacerts + public CA PEMs (+ optional internal JKS).
+
+    Returns the path to the built truststore (password _DEFAULT_STOREPASS), or "".
+    """
+    pem_files = _ca_pem_files()
+    if not pem_files and not merge_jks:
+        return ""
+
+    keytool = _keytool()
+    try:
+        shutil.copyfile(base_cacerts, _TRUSTSTORE_CACHE)
+        try:
+            os.chmod(_TRUSTSTORE_CACHE, 0o644)
+        except OSError:
+            pass
+
+        if merge_jks and os.path.isfile(merge_jks):
+            r = subprocess.run(
+                [keytool, "-importkeystore", "-noprompt",
+                 "-srckeystore", merge_jks, "-srcstorepass", merge_jks_pw or _DEFAULT_STOREPASS,
+                 "-destkeystore", _TRUSTSTORE_CACHE, "-deststorepass", _DEFAULT_STOREPASS],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode != 0:
+                logger.warning(f"Could not merge internal truststore '{merge_jks}': {r.stderr.strip()}")
+
+        imported = 0
+        for pem in pem_files:
+            alias = "hdfsmcp_" + os.path.splitext(os.path.basename(pem))[0]
+            r = subprocess.run(
+                [keytool, "-importcert", "-noprompt", "-trustcacerts",
+                 "-alias", alias, "-file", pem,
+                 "-keystore", _TRUSTSTORE_CACHE, "-storepass", _DEFAULT_STOREPASS],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode == 0:
+                imported += 1
+        logger.info(
+            f"Built TLS truststore {_TRUSTSTORE_CACHE} "
+            f"(base={base_cacerts}, +{imported}/{len(pem_files)} PEM CAs"
+            f"{', merged ' + merge_jks if merge_jks else ''})."
+        )
+        return _TRUSTSTORE_CACHE
+    except Exception as e:
+        logger.warning(f"Failed to build merged truststore: {e}")
+        return ""
+
+
+def _resolve_truststore() -> Tuple[str, str]:
+    """Return (path, password) for the JVM truststore, building one if needed."""
+    explicit = os.getenv("HDFS_MCP_TRUSTSTORE", "").strip()
+    if explicit:
+        return explicit, os.getenv("HDFS_MCP_TRUSTSTORE_PASSWORD", "").strip()
+
+    # Any internal/CM truststore to fold in (for RAZ endpoint trust).
+    internal_loc, internal_pw = _hadoop_ssl_truststore()
+    if not internal_loc:
+        for cand in (
+            "/var/lib/cloudera-scm-agent/agent-cert/cm-auto-global_truststore.jks",
+            "/etc/cdp/security/truststore/cdp-truststore.jks",
+        ):
+            if os.path.isfile(cand):
+                internal_loc = cand
+                break
+
+    base = _default_cacerts()
+    if base:
+        built = _build_truststore(base, merge_jks=internal_loc, merge_jks_pw=internal_pw)
+        if built:
+            return built, _DEFAULT_STOREPASS
+
+    # Fall back to whatever internal truststore we found, else nothing.
+    if internal_loc:
+        return internal_loc, internal_pw
+    return "", ""
 
 
 def configure_jvm_options():
     """Build LIBHDFS_OPTS without clobbering any value already set by the operator."""
+    global _ACTIVE_TRUSTSTORE
     parts: List[str] = []
     existing = os.environ.get("LIBHDFS_OPTS", "").strip()
     if existing:
         parts.append(existing)
     parts.append("-Dlog4j.configuration=file:///dev/null")
 
-    loc, pw = _detect_truststore()
+    loc, pw = _resolve_truststore()
     if loc and "javax.net.ssl.trustStore" not in existing:
+        _ACTIVE_TRUSTSTORE = loc
         parts.append(f"-Djavax.net.ssl.trustStore={loc}")
         if pw:
             parts.append(f"-Djavax.net.ssl.trustStorePassword={pw}")
         logger.info(f"Configured JVM TLS truststore: {loc}")
     elif not loc:
         logger.warning(
-            "No TLS truststore detected. If s3a:// fails with 'No trusted certificate "
-            "found', set HDFS_MCP_TRUSTSTORE (and HDFS_MCP_TRUSTSTORE_PASSWORD) to a "
-            "JKS/PKCS12 truststore that trusts the S3/RAZ endpoint certificates "
-            "(typically Hadoop's ssl-client.xml ssl.client.truststore.location)."
+            "No TLS truststore could be resolved or built. If s3a:// fails with "
+            "'No trusted certificate found', set HDFS_MCP_TRUSTSTORE (and "
+            "HDFS_MCP_TRUSTSTORE_PASSWORD), or HDFS_MCP_EXTRA_CA_PEM to add CA PEM files."
         )
 
     os.environ["LIBHDFS_OPTS"] = " ".join(parts)
@@ -523,7 +648,7 @@ def diagnose_environment() -> Dict[str, Any]:
         "HDFS_MCP_TRUSTSTORE",
     ]
     classpath = os.environ.get("CLASSPATH", "")
-    truststore_loc, _ = _detect_truststore()
+    truststore_loc = _ACTIVE_TRUSTSTORE
 
     # Locate the marker class across all discoverable jars (authoritative check).
     marker_jars: List[str] = []
@@ -549,6 +674,7 @@ def diagnose_environment() -> Dict[str, Any]:
         "jars_scanned": scanned,
         "tls_truststore": truststore_loc or None,
         "tls_truststore_found": bool(truststore_loc),
+        "tls_ca_pem_files": _ca_pem_files(),
         "supported_schemes": list(SUPPORTED_SCHEMES),
     }
 
