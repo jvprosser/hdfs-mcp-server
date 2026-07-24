@@ -165,6 +165,7 @@ Add the following to your MCP settings inside CML / Agent Studio:
       "command": "uvx",
       "args": [
         "--quiet",
+        "--no-cache",
         "--refresh",
         "--reinstall",
         "--from",
@@ -182,3 +183,11 @@ Add the following to your MCP settings inside CML / Agent Studio:
     }
   }
 }
+```
+
+> **Why `--no-cache --refresh --reinstall`?** Agent Studio launches the server with
+> `uvx`, which caches git checkouts. Without these flags a restart can keep running
+> a **stale cached build** instead of the latest commit. `--no-cache` bypasses the
+> cache entirely so each restart pulls current `main`. Once your deployment is
+> stable you can drop `--no-cache` (and even pin `git+...@<commit-sha>`) for faster,
+> reproducible startups.

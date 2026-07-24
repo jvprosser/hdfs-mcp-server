@@ -209,25 +209,65 @@ def _build_truststore(base_cacerts: str, merge_jks: str = "", merge_jks_pw: str 
                  "-keystore", _TRUSTSTORE_CACHE, "-storepass", _DEFAULT_STOREPASS],
                 capture_output=True, text=True, timeout=60,
             )
-            if r.returncode == 0:
+            # Some JDKs (e.g. Java 8 in the CDP sandbox) return a non-zero exit
+            # code even though the import succeeded ("Certificate was added to
+            # keystore"). Trust the output message over the exit code.
+            out = ((r.stdout or "") + (r.stderr or "")).lower()
+            if r.returncode == 0 or "added to keystore" in out:
                 imported += 1
             else:
                 logger.warning(f"keytool failed to import {pem}: {r.stderr.strip()}")
 
-        if not os.path.isfile(_TRUSTSTORE_CACHE) or (not have_base and not have_merge and imported == 0):
-            logger.warning("Truststore build produced no usable store (no base, no merges, 0 PEMs imported).")
+        # Verify the built store actually contains entries, regardless of the
+        # per-import exit codes. entries == -1 means "-list" couldn't be parsed
+        # (also a possible Java 8 quirk) — in that case fall back to whether any
+        # import reported success or we started from a base/merge.
+        entries = _truststore_entry_count(_TRUSTSTORE_CACHE, keytool)
+        usable = os.path.isfile(_TRUSTSTORE_CACHE) and (
+            entries > 0 or imported > 0 or have_base or have_merge
+        )
+        if not usable:
+            logger.warning(
+                f"Truststore build produced no usable store "
+                f"(imported={imported}, verified_entries={entries})."
+            )
             return ""
 
         logger.info(
             f"Built TLS truststore {_TRUSTSTORE_CACHE} "
             f"(base={base_cacerts if have_base else 'NONE(from-scratch)'}, "
             f"+{imported}/{len(pem_files)} PEM CAs"
-            f"{', merged ' + merge_jks if have_merge else ''}) via keytool={keytool}."
+            f"{', merged ' + merge_jks if have_merge else ''}, "
+            f"total_entries={entries}) via keytool={keytool}."
         )
         return _TRUSTSTORE_CACHE
     except Exception as e:
         logger.warning(f"Failed to build merged truststore: {e}")
         return ""
+
+
+def _truststore_entry_count(store: str, keytool: str) -> int:
+    """Count entries in a keystore via `keytool -list`, or -1 if it can't be read."""
+    if not os.path.isfile(store):
+        return 0
+    try:
+        r = subprocess.run(
+            [keytool, "-list", "-keystore", store, "-storepass", _DEFAULT_STOREPASS],
+            capture_output=True, text=True, timeout=60,
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        for line in out.splitlines():
+            low = line.lower()
+            if "your keystore contains" in low:
+                for tok in low.split():
+                    if tok.isdigit():
+                        return int(tok)
+        # Fallback: count "trustedCertEntry" lines.
+        n = sum(1 for ln in out.splitlines() if "trustedcertentry" in ln.lower())
+        return n if n > 0 else (-1 if r.returncode != 0 else 0)
+    except Exception as e:
+        logger.warning(f"Could not list truststore {store}: {e}")
+        return -1
 
 
 def _resolve_truststore() -> Tuple[str, str]:
