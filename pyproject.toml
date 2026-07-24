@@ -13,5 +13,10 @@ dependencies = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# The package lives under src/; hatchling ships all files inside it (including
+# the bundled CA PEMs under cacerts/) in the wheel.
+[tool.hatch.build.targets.wheel]
+packages = ["src/hdfs_mcp_server"]
+
 [project.scripts]
 hdfs-mcp-server = "hdfs_mcp_server.server:main"

@@ -103,15 +103,25 @@ roots** (e.g. Amazon/Starfield) that AWS S3 endpoints chain to — so the defaul
 `cacerts` fails even for public S3, even though the individual PEM files exist under
 `/etc/ssl/certs`.
 
+**Agent Studio sandbox note:** MCP servers run inside a bubblewrap sandbox with an
+isolated filesystem. `/runtime-addons` (and its JVM) is mounted, but `/etc/ssl` and
+`/usr/lib/jvm` typically are **not**. To stay self-sufficient the server therefore:
+
+* **bundles the public AWS root CAs** (Amazon Root CA 1–4 + Starfield Services Root
+  CA G2) inside the package (`hdfs_mcp_server/cacerts/*.pem`), so they're always
+  importable regardless of what the sandbox mounts; and
+* discovers `cacerts`/`keytool` from the **runtime-addon JVM** (under
+  `/runtime-addons/.../usr/lib/jvm/`) in addition to `JAVA_HOME`.
+
 On startup the server resolves a truststore as follows:
 
 1. If `HDFS_MCP_TRUSTSTORE` (+ `HDFS_MCP_TRUSTSTORE_PASSWORD`) is set, use it as-is.
 2. Otherwise it **builds** a truststore (cached at `HDFS_MCP_TRUSTSTORE_CACHE`,
-   default `/tmp/hdfs-mcp-truststore.jks`) = a copy of the JVM's `cacerts`, **plus**
-   public CA PEMs (default globs `Amazon_Root_CA_*.pem` + `Starfield_*.pem` under
-   `/etc/ssl/certs`), **plus** any internal/CM truststore (`ssl-client.xml`
-   `ssl.client.truststore.location` or a known CDP AutoTLS path) so the RAZ endpoint
-   stays trusted.
+   default `/tmp/hdfs-mcp-truststore.jks`) = a copy of a discovered JVM `cacerts`,
+   **plus** public CA PEMs (the bundled Amazon/Starfield roots, and — when present —
+   `Amazon_Root_CA_*.pem` + `Starfield_*.pem` under `/etc/ssl/certs`), **plus** any
+   internal/CM truststore (`ssl-client.xml` `ssl.client.truststore.location` or a
+   known CDP AutoTLS path) so the RAZ endpoint stays trusted.
 
 It injects `-Djavax.net.ssl.trustStore[Password]` into `LIBHDFS_OPTS` (without
 clobbering any value you already set). `diagnose_environment` reports the resolved

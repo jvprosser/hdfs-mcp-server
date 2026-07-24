@@ -68,23 +68,55 @@ _TRUSTSTORE_CACHE = os.getenv("HDFS_MCP_TRUSTSTORE_CACHE", "/tmp/hdfs-mcp-trusts
 _ACTIVE_TRUSTSTORE = ""
 
 
+def _candidate_java_homes() -> List[str]:
+    """Java homes to search for cacerts/keytool.
+
+    Under Agent Studio's bubblewrap sandbox, JAVA_HOME (/usr/lib/jvm/...) and
+    /etc/ssl may not be mounted, but the hadoop-cli runtime addon (which ships its
+    own JVM) is. So we also look for a JVM under the runtime addon.
+    """
+    homes: List[str] = []
+    if os.environ.get("JAVA_HOME"):
+        homes.append(os.environ["JAVA_HOME"])
+
+    search_globs = []
+    libhdfs_dir = os.environ.get("ARROW_LIBHDFS_DIR", "")
+    if libhdfs_dir:
+        search_globs.append(os.path.join(libhdfs_dir, "jvm", "*"))
+    search_globs.append("/runtime-addons/*/usr/lib/jvm/*")
+    for pat in search_globs:
+        for d in sorted(glob.glob(pat)):
+            if os.path.isdir(d):
+                homes.append(d)
+
+    seen, out = set(), []
+    for h in homes:
+        if h and h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
+
+
 def _default_cacerts() -> str:
-    """Path to the JVM's default cacerts keystore."""
-    java_home = os.environ.get("JAVA_HOME", "")
-    for p in (
-        os.path.join(java_home, "jre", "lib", "security", "cacerts") if java_home else "",
-        os.path.join(java_home, "lib", "security", "cacerts") if java_home else "",
-        "/etc/ssl/certs/java/cacerts",
-    ):
-        if p and os.path.isfile(p):
-            return p
+    """Path to a usable JVM cacerts keystore (sandbox-aware)."""
+    for home in _candidate_java_homes():
+        for p in (
+            os.path.join(home, "jre", "lib", "security", "cacerts"),
+            os.path.join(home, "lib", "security", "cacerts"),
+        ):
+            if os.path.isfile(p):
+                return p
+    if os.path.isfile("/etc/ssl/certs/java/cacerts"):
+        return "/etc/ssl/certs/java/cacerts"
     return ""
 
 
 def _keytool() -> str:
-    java_home = os.environ.get("JAVA_HOME", "")
-    candidate = os.path.join(java_home, "bin", "keytool") if java_home else ""
-    return candidate if candidate and os.path.isfile(candidate) else "keytool"
+    for home in _candidate_java_homes():
+        candidate = os.path.join(home, "bin", "keytool")
+        if os.path.isfile(candidate):
+            return candidate
+    return "keytool"
 
 
 def _ca_pem_files() -> List[str]:
@@ -95,6 +127,14 @@ def _ca_pem_files() -> List[str]:
     individual PEM files exist under /etc/ssl/certs. Import those. Additional CAs
     (e.g. an internal RAZ CA) can be supplied via HDFS_MCP_EXTRA_CA_PEM.
     """
+    files: List[str] = []
+
+    # Public root CAs bundled with the package — always available even inside a
+    # sandbox that doesn't mount /etc/ssl (e.g. Agent Studio's bubblewrap).
+    bundled_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cacerts")
+    if os.path.isdir(bundled_dir):
+        files.extend(sorted(glob.glob(os.path.join(bundled_dir, "*.pem"))))
+
     globs_env = os.getenv("HDFS_MCP_CA_PEM_GLOBS", "").strip()
     if globs_env:
         patterns = [g.strip() for g in globs_env.split(":") if g.strip()]
@@ -103,8 +143,6 @@ def _ca_pem_files() -> List[str]:
             "/etc/ssl/certs/Amazon_Root_CA_*.pem",
             "/etc/ssl/certs/Starfield_*.pem",
         ]
-
-    files: List[str] = []
     for pat in patterns:
         files.extend(sorted(glob.glob(pat)))
 
@@ -675,6 +713,9 @@ def diagnose_environment() -> Dict[str, Any]:
         "tls_truststore": truststore_loc or None,
         "tls_truststore_found": bool(truststore_loc),
         "tls_ca_pem_files": _ca_pem_files(),
+        "tls_base_cacerts": _default_cacerts() or None,
+        "tls_keytool": _keytool(),
+        "tls_candidate_java_homes": _candidate_java_homes(),
         "supported_schemes": list(SUPPORTED_SCHEMES),
     }
 
