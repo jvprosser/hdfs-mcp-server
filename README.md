@@ -150,7 +150,8 @@ string that bypasses this is the literal `"default"`, which tells libhdfs to use
 ## Included Tools
 
 * **`list_directory(path: str, recursive: bool = False)`**: Lists entries inside target URI.
-* **`open_file(path: str, max_bytes: int = 1048576, offset: int = 0, encoding: str = "utf-8")`**: Reads contents of target file safely with context guardrails.
+* **`open_text_file(path: str, max_bytes: int = 1048576, offset: int = 0, encoding: str = "utf-8")`**: Reads raw text from plain-text files (logs, code, CSV, JSON, etc.) with byte-offset pagination and context guardrails.
+* **`read_document(path: str, max_pages_or_rows: int = 20)`**: Extracts human-readable text/markdown from business documents (`.pdf`, `.docx`, `.xlsx`, `.pptx`, `.html`) via Microsoft's MarkItDown.
 
 ---
 

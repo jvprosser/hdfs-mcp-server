@@ -2,9 +2,12 @@
 # dependencies = [
 #     "mcp[cli]>=0.1.0",
 #     "pyarrow>=14.0.0",
+#     "markitdown[pdf,docx,pptx,xlsx]>=0.1.0",
+#     "pdfminer.six>=20221105",
 # ]
 # ///
 
+import io
 import os
 import re
 import sys
@@ -626,6 +629,16 @@ configure_hadoop_classpath()
 import pyarrow.fs as pafs
 from mcp.server.fastmcp import FastMCP
 
+# MarkItDown (Microsoft) powers the read_document tool. Import defensively so the
+# server still starts (and all other tools work) even if the optional dependency
+# or one of its per-format parsers is unavailable; read_document reports the issue.
+try:
+    from markitdown import MarkItDown
+    _MARKITDOWN_IMPORT_ERROR = None
+except Exception as _md_err:  # pragma: no cover - depends on runtime env
+    MarkItDown = None
+    _MARKITDOWN_IMPORT_ERROR = str(_md_err)
+
 # Initialize MCP Server
 mcp = FastMCP(
     "Cloudera Enterprise Storage MCP",
@@ -829,18 +842,23 @@ def list_directory(path: str, recursive: bool = False) -> List[Dict[str, Any]]:
 
 
 @mcp.tool()
-def open_file(
+def open_text_file(
     path: str, 
     max_bytes: int = 1048576, 
     offset: int = 0, 
     encoding: str = "utf-8"
 ) -> Dict[str, Any]:
     """
-    Open and read content from a file in HDFS, S3a, ADLS, or Ozone via RAZ authentication.
-    
+    Read raw text from a plain-text file in HDFS, S3a, ADLS, or Ozone via RAZ.
+
+    Use this for plain-text formats — logs, code, CSV, JSON, YAML, and other raw
+    text — with byte-offset pagination to page through large files. For binary
+    business documents (.pdf, .docx, .xlsx, .pptx, .html) use `read_document`
+    instead, which extracts human-readable text/markdown.
+
     :param path: Fully qualified URI (e.g., 's3a://go01-demo/warehouse/table/part1.csv')
-    :param max_bytes: Maximum bytes to read to protect context window (default 1MB).
-    :param offset: Byte offset to start reading from.
+    :param max_bytes: Maximum bytes to read to protect the context window (default 1MB).
+    :param offset: Byte offset to start reading from (for pagination).
     :param encoding: String encoding (default 'utf-8'). Use 'bytes' for raw hex output.
     :return: File content metadata and body payload.
     """
@@ -876,6 +894,134 @@ def open_file(
             
     except Exception as e:
         return {"error": f"Failed to read file '{path}': {str(e)}"}
+
+
+# Business-document formats MarkItDown extracts to markdown for read_document.
+_DOCUMENT_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".pptx", ".html", ".htm")
+
+
+def _limit_markdown(text: str, max_units: int) -> Tuple[str, bool]:
+    """Cap converted markdown to protect the context window.
+
+    For table-heavy output (spreadsheets/CSV-like), keep the table header plus up
+    to ``max_units`` data rows. For prose/paged documents (which MarkItDown emits
+    as a single stream that can't be reliably page-split), cap to a character
+    budget proportional to ``max_units``. Returns (text, truncated).
+    """
+    if max_units < 1:
+        max_units = 1
+    lines = text.splitlines()
+    table_lines = sum(1 for l in lines if l.lstrip().startswith("|"))
+
+    if table_lines >= 3:
+        kept: List[str] = []
+        data_rows = 0
+        truncated = False
+        for l in lines:
+            stripped = l.lstrip()
+            is_row = stripped.startswith("|")
+            is_sep = is_row and set(stripped) <= set("|:- ")
+            kept.append(l)
+            if is_row and not is_sep:
+                data_rows += 1
+                # First data-looking row is the header; allow max_units beyond it.
+                if data_rows >= max_units + 1:
+                    truncated = True
+                    break
+        return "\n".join(kept), truncated
+
+    budget = max(4000, max_units * 2000)
+    if len(text) > budget:
+        return text[:budget], True
+    return text, False
+
+
+@mcp.tool()
+def read_document(path: str, max_pages_or_rows: int = 20) -> Dict[str, Any]:
+    """
+    Extract human-readable text/markdown from a business document in HDFS, S3a,
+    ADLS, or Ozone via RAZ.
+
+    Handles common binary document formats — .pdf, .docx, .xlsx, .pptx, .html —
+    by converting them to clean Markdown with Microsoft's MarkItDown. For plain
+    text/logs/code/CSV/JSON, use `open_text_file` instead.
+
+    :param path: Fully qualified URI (e.g., 's3a://go01-demo/reports/q3.pdf').
+    :param max_pages_or_rows: Soft cap on returned content — table data rows for
+        spreadsheets, or a proportional character budget for paged/prose documents
+        (default 20). Increase to retrieve more.
+    :return: Dict with extracted markdown 'content' and metadata, or an 'error'.
+    """
+    if MarkItDown is None:
+        return {
+            "error": "The 'markitdown' library is not available, so document "
+                     "extraction is disabled. Install 'markitdown[pdf,docx,pptx,xlsx]' "
+                     f"or use 'open_text_file' for plain text. Import error: {_MARKITDOWN_IMPORT_ERROR}"
+        }
+
+    fs, clean_path = resolve_filesystem(path)
+    ext = os.path.splitext(clean_path)[1].lower()
+
+    if ext not in _DOCUMENT_EXTENSIONS:
+        return {
+            "error": f"Unsupported document type '{ext or '(none)'}' for read_document. "
+                     f"Supported: {', '.join(_DOCUMENT_EXTENSIONS)}. For plain text, "
+                     "logs, code, CSV, or JSON use 'open_text_file' instead.",
+            "path": path,
+        }
+
+    try:
+        info = fs.get_file_info(clean_path)
+        if info.type == pafs.FileType.Directory:
+            return {"error": f"Path '{path}' is a directory, not a file."}
+
+        with fs.open_input_stream(clean_path) as stream:
+            data = stream.read()
+
+        md = MarkItDown()
+        # MarkItDown's convert_stream signature has shifted across releases; try the
+        # explicit file-extension hint first, then fall back to content sniffing.
+        result = None
+        conversion_error = None
+        for kwargs in ({"file_extension": ext}, {}):
+            try:
+                result = md.convert_stream(io.BytesIO(data), **kwargs)
+                break
+            except TypeError as te:
+                conversion_error = te
+                continue
+        if result is None and conversion_error is not None:
+            raise conversion_error
+
+        text = getattr(result, "text_content", None) or getattr(result, "markdown", "") or ""
+        if not text.strip():
+            return {
+                "error": f"No extractable text found in '{path}'. The document may be "
+                         "empty, image-only/scanned, or password-protected.",
+                "path": path,
+                "extension": ext,
+            }
+
+        content, truncated = _limit_markdown(text, max_pages_or_rows)
+        return {
+            "path": path,
+            "extension": ext,
+            "converted_via": "markitdown",
+            "total_chars": len(text),
+            "returned_chars": len(content),
+            "truncated": truncated,
+            "max_pages_or_rows": max_pages_or_rows,
+            "content": content,
+        }
+
+    except Exception as e:
+        return {
+            "error": f"Failed to extract document '{path}': {str(e)}. If this is a "
+                     "plain-text file, use 'open_text_file'; otherwise verify the file "
+                     "type is one of: " + ", ".join(_DOCUMENT_EXTENSIONS) + ".",
+            "path": path,
+            "extension": ext,
+        }
 
 
 @mcp.tool()
