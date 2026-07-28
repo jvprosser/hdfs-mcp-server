@@ -1,6 +1,6 @@
 # /// script
 # dependencies = [
-#     "mcp[cli]>=0.1.0",
+#     "mcp[cli]>=1.2.0,<2",
 #     "pyarrow>=14.0.0",
 #     "markitdown[pdf,docx,pptx,xlsx]>=0.1.0",
 #     "pdfminer.six>=20221105",
