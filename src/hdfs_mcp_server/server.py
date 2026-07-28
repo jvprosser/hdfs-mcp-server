@@ -18,7 +18,7 @@ import tempfile
 import subprocess
 import zipfile
 import xml.etree.ElementTree as ET
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urlparse
 
 # 1. Force Python logging to stderr to keep stdout clean for MCP JSON-RPC traffic
@@ -684,6 +684,30 @@ def get_user_context() -> str:
     return candidate
 
 
+def _brokered_credential_source() -> Optional[str]:
+    """Return a label for a usable Hadoop credential visible to this process.
+
+    RAZ needs an authenticated identity (Kerberos ticket or Hadoop delegation
+    token) to broker S3 credentials. A delegation token in
+    ``HADOOP_TOKEN_FILE_LOCATION`` already encodes the authenticated user, and
+    Hadoop only loads it onto the *login* UGI. Returns the source label, or None
+    when neither is present.
+    """
+    token_file = os.environ.get("HADOOP_TOKEN_FILE_LOCATION", "")
+    if token_file and os.path.isfile(token_file):
+        return f"delegation_token:{token_file}"
+
+    krb5ccname = os.environ.get("KRB5CCNAME", "")
+    cc_path = krb5ccname.split(":", 1)[1] if ":" in krb5ccname else krb5ccname
+    if cc_path and os.path.isfile(cc_path):
+        return f"krb5_ccache:{cc_path}"
+    if hasattr(os, "getuid"):
+        default_cc = f"/tmp/krb5cc_{os.getuid()}"
+        if os.path.isfile(default_cc):
+            return f"krb5_ccache:{default_cc}"
+    return None
+
+
 def build_raz_conf() -> Dict[str, str]:
     """Return extra Hadoop configuration required for RAZ-authorized access.
 
@@ -785,7 +809,20 @@ def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
         relative_path = rel if rel.startswith("/") else f"/{rel}"
 
     user = get_user_context()
-    cache_key = (default_fs or "default", user)
+
+    # If a Hadoop delegation token (or Kerberos ticket) is available, it already
+    # carries the authenticated identity that RAZ authorizes against. Forcing a
+    # libhdfs ``user=`` in that case makes libhdfs build a SIMPLE-auth
+    # createRemoteUser() UGI that does NOT carry the delegation tokens (Hadoop
+    # loads those onto the *login* user), so RAZ never sees the token and returns
+    # 403. When a credential is present we therefore let libhdfs use the login
+    # user. Set HDFS_MCP_FORCE_USER=1 to override and always pass ``user=``.
+    credential = _brokered_credential_source()
+    force_user = (os.getenv("HDFS_MCP_FORCE_USER") or "").strip().lower() in ("1", "true", "yes")
+    use_login_identity = bool(credential) and not force_user
+    effective_user = None if use_login_identity else user
+
+    cache_key = (default_fs or "default", effective_user or "<login>")
 
     fs = _FS_CACHE.get(cache_key)
     if fs is None:
@@ -793,17 +830,24 @@ def resolve_filesystem(path_uri: str) -> Tuple[pafs.FileSystem, str]:
         if default_fs:
             extra_conf["fs.defaultFS"] = default_fs
         try:
-            fs = pafs.HadoopFileSystem(
-                host="default",
-                port=0,
-                user=user,
-                extra_conf=extra_conf,
-            )
+            fs_kwargs: Dict[str, Any] = dict(host="default", port=0, extra_conf=extra_conf)
+            if effective_user:
+                fs_kwargs["user"] = effective_user
+            fs = pafs.HadoopFileSystem(**fs_kwargs)
             _FS_CACHE[cache_key] = fs
-            logger.info(
-                f"Initialized RAZ-authorized filesystem "
-                f"(fs.defaultFS='{default_fs or '<core-site>'}') as user '{user}'"
-            )
+            if use_login_identity:
+                logger.info(
+                    f"Initialized RAZ-authorized filesystem "
+                    f"(fs.defaultFS='{default_fs or '<core-site>'}') using login-user "
+                    f"identity from {credential} (delegation token / ticket carries the "
+                    f"authenticated user for RAZ)"
+                )
+            else:
+                logger.info(
+                    f"Initialized RAZ-authorized filesystem "
+                    f"(fs.defaultFS='{default_fs or '<core-site>'}') as user '{user}' "
+                    f"(no delegation token / ticket detected — RAZ needs one to broker S3)"
+                )
         except Exception as e:
             logger.error(f"Failed to initialize filesystem for {path_uri}: {str(e)}")
             raise RuntimeError(f"Storage connection failed via RAZ: {str(e)}")
@@ -1062,12 +1106,21 @@ def _kerberos_diagnostics() -> Dict[str, Any]:
     )
     have_token = bool(token_file) and os.path.isfile(token_file)
 
+    credential = _brokered_credential_source()
+    force_user = (os.getenv("HDFS_MCP_FORCE_USER") or "").strip().lower() in ("1", "true", "yes")
+    if credential and not force_user:
+        fs_identity_mode = "login-user (delegation token / ticket identity used for RAZ)"
+    else:
+        fs_identity_mode = "libhdfs user= override (simple auth; no token picked up)"
+
     return {
         "env": env,
         "krb5_ccache": _file_state(cc_path),
         "default_krb5_ccache": _file_state(default_cc),
         "hadoop_delegation_token_file": _file_state(token_file),
         "has_usable_credential": bool(have_ccache or have_token),
+        "credential_source": credential,
+        "fs_identity_mode": fs_identity_mode,
         "note": (
             "If has_usable_credential is False, the sandboxed server has no Kerberos "
             "ticket or delegation token, so IDBroker/RAZ cannot broker S3 credentials "

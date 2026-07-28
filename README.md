@@ -145,6 +145,54 @@ string that bypasses this is the literal `"default"`, which tells libhdfs to use
 `s3a://YOURBUCKET` — so libhdfs instantiates the correct Java `S3AFileSystem`
 (where RAZ is enforced). Requested paths are then resolved relative to that bucket.
 
+### Authentication (Kerberos ticket / delegation token)
+
+RAZ can only broker S3 credentials **after** it authenticates the caller. On CDP
+Public Cloud, `s3a://` + RAZ authenticates via **Kerberos** (through Knox), and RAZ
+then authorizes each S3 operation against the Ranger policies for that identity.
+
+**Symptom of a missing credential:** `list_directory` may succeed (bucket listing
+can resolve via the environment's broadly-scoped role) while `open_text_file` /
+`stream_file` fail with:
+
+```
+S3Exception: ... Status Code: 403 ... getFileStatus on s3a://.../file: AccessDeniedException
+```
+
+That split — list works, per-object `HeadObject`/`GetObject` returns 403 — means the
+process has **no authenticated identity** for RAZ. In the Agent Studio bubblewrap
+sandbox this is common: the sandbox does **not** inherit your interactive Kerberos
+ticket cache (`/tmp/krb5cc_*` is not shared).
+
+Run **`diagnose_environment`** and inspect the `kerberos` block:
+
+* `has_usable_credential: false` → no ticket and no delegation token were found.
+* `credential_source` / `fs_identity_mode` → which identity the filesystem will use.
+
+**Fix — supply a Hadoop delegation token.** A delegation token encapsulates the RAZ
+credential and **encodes the authenticated user**, so it works in a non-interactive
+sandbox without a live TGT. Generate it on a kerberized node **as the target user**:
+
+```bash
+klist                                   # confirm a valid TGT as the right user
+hadoop dtutil get s3a://YOURBUCKET/ -format protobuf /home/cdsw/hdfs_mcp.dt
+hadoop dtutil print /home/cdsw/hdfs_mcp.dt   # verify an s3a/RAZ token entry exists
+```
+
+Then point the server at it via `HADOOP_TOKEN_FILE_LOCATION` (see the config
+example below). The file must live somewhere the sandbox actually mounts (e.g. a
+project / `/home/cdsw` path that maps into `/workspace`) — not `/tmp`.
+
+> **Identity handling.** When a delegation token (or ticket) is detected, the server
+> lets libhdfs use the **login user** so Hadoop loads the token's credentials — the
+> token's owner is the identity RAZ authorizes against. If it instead forced a
+> libhdfs `user=` override, libhdfs would build a SIMPLE-auth `createRemoteUser()`
+> UGI that does **not** carry the token, and RAZ would still return 403. Set
+> `HDFS_MCP_FORCE_USER=1` to restore the always-override behavior.
+
+Tokens expire (typically ≤ ~24h). For a long-running server, refresh the token file
+before it lapses or reads will start failing with 403 again.
+
 ---
 
 ## Included Tools
@@ -179,7 +227,8 @@ Add the following to your MCP settings inside CML / Agent Studio:
         "LD_LIBRARY_PATH": "/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64/server:/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/native",
         "CLASSPATH": "/etc/hadoop/conf:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-hdfs/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-hdfs/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-mapreduce/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-mapreduce/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-aws/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-aws/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-azure/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-azure/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/ranger-raz/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/ranger-raz/lib/*:/usr/lib/hadoop-aws/*:/usr/lib/hadoop-aws/lib/*:/usr/lib/ranger-raz/*:/usr/lib/ranger-raz/lib/*",
         "CDP_WORKLOAD_USER": "<workload user>",
-        "HDFS_MCP_DEFAULT_FS": "s3a://YOURBUCKET"
+        "HDFS_MCP_DEFAULT_FS": "s3a://YOURBUCKET",
+        "HADOOP_TOKEN_FILE_LOCATION": "/home/cdsw/hdfs_mcp.dt"
       }
     }
   }
