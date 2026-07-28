@@ -1024,6 +1024,59 @@ def stream_file(path: str, max_pages_or_rows: int = 20) -> Dict[str, Any]:
         }
 
 
+def _kerberos_diagnostics() -> Dict[str, Any]:
+    """Report the Kerberos/credential state the process actually sees.
+
+    CDP Public Cloud RAZ brokers S3 credentials via IDBroker, which authenticates
+    the caller with **Kerberos** (or a Hadoop delegation token). The libhdfs
+    ``user=`` argument only sets a *simple* username and does NOT authenticate to
+    IDBroker, so without a ticket cache / keytab / delegation token, s3a:// access
+    fails with HTTP 403 AccessDenied even for files the user owns.
+    """
+    def _file_state(p: str) -> Dict[str, Any]:
+        return {
+            "path": p,
+            "exists": bool(p) and os.path.exists(p),
+            "readable": bool(p) and os.path.isfile(p) and os.access(p, os.R_OK),
+            "size_bytes": (os.path.getsize(p) if p and os.path.isfile(p) else None),
+        }
+
+    krb5ccname = os.environ.get("KRB5CCNAME", "")
+    # KRB5CCNAME may be prefixed with a type, e.g. "FILE:/tmp/krb5cc_123".
+    cc_path = krb5ccname.split(":", 1)[1] if ":" in krb5ccname else krb5ccname
+    default_cc = f"/tmp/krb5cc_{os.getuid()}" if hasattr(os, "getuid") else ""
+    token_file = os.environ.get("HADOOP_TOKEN_FILE_LOCATION", "")
+
+    env = {
+        k: os.environ.get(k)
+        for k in (
+            "KRB5CCNAME", "KRB5_CONFIG", "HADOOP_TOKEN_FILE_LOCATION",
+            "HADOOP_USER_NAME", "HADOOP_PROXY_USER", "HADOOP_OPTS",
+        )
+    }
+    # Report only presence for anything token-like (avoid leaking secrets).
+    env["CDP_TOKEN_present"] = bool(os.environ.get("CDP_TOKEN"))
+
+    have_ccache = (bool(cc_path) and os.path.isfile(cc_path)) or (
+        bool(default_cc) and os.path.isfile(default_cc)
+    )
+    have_token = bool(token_file) and os.path.isfile(token_file)
+
+    return {
+        "env": env,
+        "krb5_ccache": _file_state(cc_path),
+        "default_krb5_ccache": _file_state(default_cc),
+        "hadoop_delegation_token_file": _file_state(token_file),
+        "has_usable_credential": bool(have_ccache or have_token),
+        "note": (
+            "If has_usable_credential is False, the sandboxed server has no Kerberos "
+            "ticket or delegation token, so IDBroker/RAZ cannot broker S3 credentials "
+            "and s3a:// returns 403 AccessDenied. Make a ticket cache (KRB5CCNAME) or "
+            "delegation token (HADOOP_TOKEN_FILE_LOCATION) available to the server."
+        ),
+    }
+
+
 @mcp.tool()
 def diagnose_environment() -> Dict[str, Any]:
     """
@@ -1043,6 +1096,7 @@ def diagnose_environment() -> Dict[str, Any]:
     ]
     classpath = os.environ.get("CLASSPATH", "")
     truststore_loc = _ACTIVE_TRUSTSTORE
+    kerberos = _kerberos_diagnostics()
 
     # Locate the marker class across all discoverable jars (authoritative check).
     marker_jars: List[str] = []
@@ -1073,6 +1127,7 @@ def diagnose_environment() -> Dict[str, Any]:
         "tls_base_cacerts": _default_cacerts() or None,
         "tls_keytool": _keytool(),
         "tls_candidate_java_homes": _candidate_java_homes(),
+        "kerberos": kerberos,
         "supported_schemes": list(SUPPORTED_SCHEMES),
     }
 
