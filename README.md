@@ -151,7 +151,7 @@ string that bypasses this is the literal `"default"`, which tells libhdfs to use
 
 * **`list_directory(path: str, recursive: bool = False)`**: Lists entries inside target URI.
 * **`open_text_file(path: str, max_bytes: int = 1048576, offset: int = 0, encoding: str = "utf-8")`**: Reads raw text from plain-text files (logs, code, CSV, JSON, etc.) with byte-offset pagination and context guardrails.
-* **`read_document(path: str, max_pages_or_rows: int = 20)`**: Extracts human-readable text/markdown from business documents (`.pdf`, `.docx`, `.xlsx`, `.pptx`, `.html`) via Microsoft's MarkItDown.
+* **`stream_file(path: str, max_pages_or_rows: int = 20)`**: Extracts human-readable text/markdown from business documents (`.pdf`, `.docx`, `.xlsx`, `.pptx`, `.html`) via Microsoft's MarkItDown.
 
 ---
 
@@ -178,7 +178,8 @@ Add the following to your MCP settings inside CML / Agent Studio:
         "ARROW_LIBHDFS_DIR": "/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib",
         "LD_LIBRARY_PATH": "/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64/server:/usr/lib/jvm/java-8-openjdk-amd64/jre/lib/amd64:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/native",
         "CLASSPATH": "/etc/hadoop/conf:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-hdfs/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-hdfs/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-mapreduce/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-mapreduce/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-aws/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-aws/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-azure/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/hadoop-azure/lib/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/ranger-raz/*:/runtime-addons/hadoop-cli-7.3.1.101-c2jhs/usr/lib/ranger-raz/lib/*:/usr/lib/hadoop-aws/*:/usr/lib/hadoop-aws/lib/*:/usr/lib/ranger-raz/*:/usr/lib/ranger-raz/lib/*",
-        "CDP_WORKLOAD_USER": "$CML_USER"
+        "CDP_WORKLOAD_USER": "<workload user>",
+        "HDFS_MCP_DEFAULT_FS": "s3a://YOURBUCKET"
       }
     }
   }

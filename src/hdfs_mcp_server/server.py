@@ -629,9 +629,9 @@ configure_hadoop_classpath()
 import pyarrow.fs as pafs
 from mcp.server.fastmcp import FastMCP
 
-# MarkItDown (Microsoft) powers the read_document tool. Import defensively so the
+# MarkItDown (Microsoft) powers the stream_file tool. Import defensively so the
 # server still starts (and all other tools work) even if the optional dependency
-# or one of its per-format parsers is unavailable; read_document reports the issue.
+# or one of its per-format parsers is unavailable; stream_file reports the issue.
 try:
     from markitdown import MarkItDown
     _MARKITDOWN_IMPORT_ERROR = None
@@ -853,7 +853,7 @@ def open_text_file(
 
     Use this for plain-text formats — logs, code, CSV, JSON, YAML, and other raw
     text — with byte-offset pagination to page through large files. For binary
-    business documents (.pdf, .docx, .xlsx, .pptx, .html) use `read_document`
+    business documents (.pdf, .docx, .xlsx, .pptx, .html) use `stream_file`
     instead, which extracts human-readable text/markdown.
 
     :param path: Fully qualified URI (e.g., 's3a://go01-demo/warehouse/table/part1.csv')
@@ -896,7 +896,7 @@ def open_text_file(
         return {"error": f"Failed to read file '{path}': {str(e)}"}
 
 
-# Business-document formats MarkItDown extracts to markdown for read_document.
+# Business-document formats MarkItDown extracts to markdown for stream_file.
 _DOCUMENT_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".pptx", ".html", ".htm")
 
 
@@ -937,7 +937,7 @@ def _limit_markdown(text: str, max_units: int) -> Tuple[str, bool]:
 
 
 @mcp.tool()
-def read_document(path: str, max_pages_or_rows: int = 20) -> Dict[str, Any]:
+def stream_file(path: str, max_pages_or_rows: int = 20) -> Dict[str, Any]:
     """
     Extract human-readable text/markdown from a business document in HDFS, S3a,
     ADLS, or Ozone via RAZ.
@@ -964,7 +964,7 @@ def read_document(path: str, max_pages_or_rows: int = 20) -> Dict[str, Any]:
 
     if ext not in _DOCUMENT_EXTENSIONS:
         return {
-            "error": f"Unsupported document type '{ext or '(none)'}' for read_document. "
+            "error": f"Unsupported document type '{ext or '(none)'}' for stream_file. "
                      f"Supported: {', '.join(_DOCUMENT_EXTENSIONS)}. For plain text, "
                      "logs, code, CSV, or JSON use 'open_text_file' instead.",
             "path": path,
