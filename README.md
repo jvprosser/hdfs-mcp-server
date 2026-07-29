@@ -193,6 +193,28 @@ project / `/home/cdsw` path that maps into `/workspace`) — not `/tmp`.
 Tokens expire (typically ≤ ~24h). For a long-running server, refresh the token file
 before it lapses or reads will start failing with 403 again.
 
+#### Unmapped UID (UnixPrincipal NPE)
+
+Using the login-user identity means Hadoop performs an **OS login**, which calls
+`getpwuid()` for the process UID. In the bubblewrap sandbox the UID often has **no
+`/etc/passwd` entry**, so login fails with:
+
+```
+LoginException: java.lang.NullPointerException: invalid null input: name
+    at com.sun.security.auth.UnixPrincipal.<init>(...)
+    at com.sun.security.auth.module.UnixLoginModule.login(...)
+```
+
+This aborts the whole Hadoop login **before** the delegation token is applied (so
+`s3a://` fails even with a valid token). `HADOOP_USER_NAME` does **not** fix it — the
+OS module is `REQUIRED` and throws before Hadoop's own module runs. On startup the
+server therefore **self-registers a passwd entry** for its UID (the standard
+OpenShift "arbitrary UID" fix) when the UID is unmapped and `/etc/passwd` is
+writable. If `/etc/passwd` is read-only, the platform must run the workload as a UID
+that already has a passwd entry. Disable the self-registration with
+`HDFS_MCP_WRITE_PASSWD=0`. `diagnose_environment` reports this under
+`kerberos.os_login` (`euid`, `os_user`, `uid_resolvable`).
+
 ---
 
 ## Included Tools

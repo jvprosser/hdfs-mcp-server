@@ -29,6 +29,96 @@ logger = logging.getLogger("hdfs-mcp-server")
 os.environ["HADOOP_ROOT_LOGGER"] = "WARN,console"
 
 
+def _workload_user_name() -> str:
+    """Best-effort workload username for OS/UGI login (not RAZ authz).
+
+    This is only used to give the process UID a resolvable name so Hadoop's
+    UnixLoginModule doesn't NPE. RAZ still authorizes by the delegation token's
+    owner, so this value need not match the token owner.
+    """
+    for var in ("CDP_WORKLOAD_USER", "HADOOP_USER_NAME", "CML_USER", "USER"):
+        val = (os.getenv(var) or "").strip()
+        if val and not val.startswith("$"):
+            return val
+    return "cdsw"
+
+
+def ensure_passwd_entry() -> None:
+    """Make the process UID resolvable to a username before the JVM logs in.
+
+    In the Agent Studio bubblewrap sandbox the process often runs as a UID with
+    **no /etc/passwd entry**. Hadoop's login runs the OS-specific JAAS module
+    (UnixLoginModule), which calls getpwuid() natively; with no passwd entry the
+    username is null and login fails with:
+
+        LoginException: java.lang.NullPointerException: invalid null input: name
+
+    This aborts the entire Hadoop login *before* the delegation token can be
+    applied, so s3a:// fails even with a valid token. Note HADOOP_USER_NAME does
+    NOT fix this: the OS module is REQUIRED and throws before Hadoop's own module
+    (which reads HADOOP_USER_NAME) reaches commit().
+
+    The standard container fix (OpenShift "arbitrary UID" pattern) is to add a
+    passwd entry for the current UID. We do that here, best-effort, when the UID
+    is unmapped and /etc/passwd is writable. Disable with HDFS_MCP_WRITE_PASSWD=0.
+    """
+    if not hasattr(os, "geteuid"):
+        return  # non-POSIX; nothing to do
+
+    name = _workload_user_name()
+    # Belt-and-suspenders: also expose the name to Hadoop's login module.
+    os.environ.setdefault("HADOOP_USER_NAME", name)
+
+    try:
+        import pwd
+    except Exception:
+        return
+
+    euid = os.geteuid()
+    try:
+        pwd.getpwuid(euid)
+        return  # already resolvable — nothing to do
+    except KeyError:
+        pass
+
+    if (os.getenv("HDFS_MCP_WRITE_PASSWD") or "").strip().lower() in ("0", "false", "no"):
+        logger.warning(
+            f"UID {euid} has no /etc/passwd entry and HDFS_MCP_WRITE_PASSWD is disabled. "
+            "Hadoop UGI login will fail with a UnixPrincipal NPE and s3a:// will not work."
+        )
+        return
+
+    gid = os.getegid()
+    home = os.environ.get("HOME") or "/workspace"
+    entry = f"{name}:x:{euid}:{gid}:{name} workload user:{home}:/bin/bash\n"
+    try:
+        with open("/etc/passwd", "a") as fh:
+            fh.write(entry)
+    except Exception as e:
+        logger.warning(
+            f"UID {euid} is not in /etc/passwd and it could not be written ({e}). "
+            "Hadoop UGI login will fail with 'NullPointerException: invalid null input: name'. "
+            "The platform must run the workload as a UID present in /etc/passwd (or make "
+            "/etc/passwd writable so the server can self-register)."
+        )
+        return
+
+    try:
+        pwd.getpwuid(euid)
+        logger.info(
+            f"Registered passwd entry for UID {euid} as '{name}' so Hadoop UGI login "
+            "can resolve the OS user (delegation-token identity is still used for RAZ)."
+        )
+    except KeyError:
+        logger.warning(
+            f"Wrote a passwd entry for UID {euid} but it still does not resolve; "
+            "Hadoop UGI login may fail."
+        )
+
+
+ensure_passwd_entry()
+
+
 # 2b. TLS truststore for the libhdfs JVM.
 # The AWS SDK v2 HTTP client (used by the S3A connector) validates endpoint
 # certificates against the JVM's truststore. In a CDP RAZ environment the correct
@@ -1113,6 +1203,20 @@ def _kerberos_diagnostics() -> Dict[str, Any]:
     else:
         fs_identity_mode = "libhdfs user= override (simple auth; no token picked up)"
 
+    # OS-login resolvability: Hadoop's UnixLoginModule NPEs if the UID has no
+    # passwd entry, which aborts login *before* the delegation token is applied.
+    os_login: Dict[str, Any] = {}
+    if hasattr(os, "geteuid"):
+        euid = os.geteuid()
+        os_login["euid"] = euid
+        try:
+            import pwd
+            os_login["os_user"] = pwd.getpwuid(euid).pw_name
+            os_login["uid_resolvable"] = True
+        except Exception:
+            os_login["os_user"] = None
+            os_login["uid_resolvable"] = False
+
     return {
         "env": env,
         "krb5_ccache": _file_state(cc_path),
@@ -1121,6 +1225,7 @@ def _kerberos_diagnostics() -> Dict[str, Any]:
         "has_usable_credential": bool(have_ccache or have_token),
         "credential_source": credential,
         "fs_identity_mode": fs_identity_mode,
+        "os_login": os_login,
         "note": (
             "If has_usable_credential is False, the sandboxed server has no Kerberos "
             "ticket or delegation token, so IDBroker/RAZ cannot broker S3 credentials "
@@ -1199,11 +1304,20 @@ def _log_credential_state() -> None:
         return
 
     tok = k.get("hadoop_delegation_token_file", {})
+    osl = k.get("os_login", {})
     if k.get("has_usable_credential"):
         logger.info(
             f"Credential check: usable credential FOUND "
-            f"(source={k.get('credential_source')}, mode={k.get('fs_identity_mode')})"
+            f"(source={k.get('credential_source')}, mode={k.get('fs_identity_mode')}); "
+            f"os_login uid={osl.get('euid')} user={osl.get('os_user')!r} "
+            f"resolvable={osl.get('uid_resolvable')}"
         )
+        if osl.get("uid_resolvable") is False:
+            logger.warning(
+                "Process UID has no passwd entry — Hadoop UGI login will NPE "
+                "(UnixPrincipal null name) before the token is applied. See "
+                "ensure_passwd_entry / HDFS_MCP_WRITE_PASSWD."
+            )
     else:
         logger.warning(
             "Credential check: NO usable Kerberos ticket or delegation token found. "
