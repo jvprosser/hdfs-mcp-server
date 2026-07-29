@@ -1158,6 +1158,67 @@ def stream_file(path: str, max_pages_or_rows: int = 20) -> Dict[str, Any]:
         }
 
 
+def _hadoop_conf_report() -> Dict[str, Any]:
+    """Report RAZ/S3A-relevant keys from the effective core-site.xml.
+
+    Whether the loaded delegation token actually authorizes S3 access depends on
+    the S3A delegation-token binding and RAZ settings being present in the
+    core-site.xml this process reads. Surfacing these lets us tell whether S3A
+    will even consult the token (vs. falling back to a credential chain and 403).
+    """
+    conf_dirs: List[str] = []
+    if os.environ.get("HADOOP_CONF_DIR"):
+        conf_dirs.append(os.environ["HADOOP_CONF_DIR"])
+    conf_dirs.append("/etc/hadoop/conf")
+
+    # Substrings that select the keys worth reporting for RAZ/S3A DT debugging.
+    wanted = (
+        "raz",
+        "s3a.delegation",
+        "s3a.bucket",
+        "s3a.aws.credentials.provider",
+        "s3a.signature",
+        "s3a.endpoint",
+        "s3a.security",
+        "delegation.token",
+        "hadoop.security.authentication",
+        "idbroker",
+        "cab",
+    )
+
+    core_site_path = None
+    values: Dict[str, str] = {}
+    seen = set()
+    for d in conf_dirs:
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        path = os.path.join(d, "core-site.xml")
+        if not os.path.isfile(path):
+            continue
+        if core_site_path is None:
+            core_site_path = path
+        try:
+            root = ET.parse(path).getroot()
+            for prop in root.findall("property"):
+                name_el = prop.find("name")
+                val_el = prop.find("value")
+                if name_el is None or name_el.text is None:
+                    continue
+                key = name_el.text.strip()
+                low = key.lower()
+                if any(w in low for w in wanted):
+                    values[key] = (val_el.text or "").strip() if val_el is not None else ""
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Could not parse {path}: {e}")
+
+    return {
+        "core_site": core_site_path,
+        "s3a_delegation_token_binding": values.get("fs.s3a.delegation.token.binding"),
+        "raz_and_s3a_keys": values,
+    }
+
+
 def _kerberos_diagnostics() -> Dict[str, Any]:
     """Report the Kerberos/credential state the process actually sees.
 
@@ -1286,6 +1347,7 @@ def diagnose_environment() -> Dict[str, Any]:
         "tls_keytool": _keytool(),
         "tls_candidate_java_homes": _candidate_java_homes(),
         "kerberos": kerberos,
+        "hadoop_conf": _hadoop_conf_report(),
         "supported_schemes": list(SUPPORTED_SCHEMES),
     }
 
