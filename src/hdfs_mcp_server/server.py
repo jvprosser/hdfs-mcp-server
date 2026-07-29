@@ -1185,7 +1185,39 @@ def diagnose_environment() -> Dict[str, Any]:
     }
 
 
+def _log_credential_state() -> None:
+    """Emit the Kerberos/delegation-token state to stderr at startup.
+
+    Agent Studio's agent summarizes tool output into prose, which hides the raw
+    ``diagnose_environment`` fields. Logging this to stderr surfaces the ground
+    truth in the MCP server logs regardless of how the agent renders tool output.
+    """
+    try:
+        k = _kerberos_diagnostics()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"Could not compute credential diagnostics: {e}")
+        return
+
+    tok = k.get("hadoop_delegation_token_file", {})
+    if k.get("has_usable_credential"):
+        logger.info(
+            f"Credential check: usable credential FOUND "
+            f"(source={k.get('credential_source')}, mode={k.get('fs_identity_mode')})"
+        )
+    else:
+        logger.warning(
+            "Credential check: NO usable Kerberos ticket or delegation token found. "
+            "RAZ cannot broker S3 credentials, so s3a:// reads will fail with 403. "
+            f"HADOOP_TOKEN_FILE_LOCATION={k.get('env', {}).get('HADOOP_TOKEN_FILE_LOCATION')!r} "
+            f"(exists={tok.get('exists')}, readable={tok.get('readable')}, "
+            f"size_bytes={tok.get('size_bytes')}); "
+            f"KRB5CCNAME={k.get('env', {}).get('KRB5CCNAME')!r}. "
+            "Ensure the token/ticket file is readable at that exact path INSIDE the sandbox."
+        )
+
+
 def main():
+    _log_credential_state()
     mcp.run()
 
 
