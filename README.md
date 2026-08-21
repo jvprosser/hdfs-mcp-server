@@ -1,6 +1,6 @@
 # hdfs-mcp-server
 Handy Cloudera HDFS tools
-# HDFS & Enterprise Storage MCP Server
+# HDFS & Enterprise Storage MCP Server (Not working yet)
 
 An Model Context Protocol (MCP) Server for **Cloudera Agent Studio**. Provides seamless access to files stored in **HDFS**, **S3a**, **ADLS (ABFS)**, and **Apache Ozone (OFS)** using CDP's **Ranger Authorization Service (RAZ)** and user workload session context.
 
